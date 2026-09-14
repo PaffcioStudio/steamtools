@@ -1,0 +1,6 @@
+PyQt6>=6.7,<7
+PyQt6-Fluent-Widgets[full]>=1.11,<2
+PyInstaller>=6.10,<7
+beautifulsoup4>=4.12,<5
+lxml>=5.0,<6
+psutil>=5.9,<7
