@@ -1,0 +1,36 @@
+# Środowisko wirtualne
+.venv/
+venv/
+
+# Steamworks SDK: TYLKO libsteam_api.so jest trzymane w repo (celowo, waży
+# mało, mygit ma je uwzględniać w snapshotach żeby nie pobierać SDK od nowa
+# za każdym razem). Ignorujemy jednak resztę ewentualnie rozpakowanego SDK,
+# gdyby ktoś wrzucił cały folder sdk/ do steamtools/vendor/ przez pomyłkę.
+steamtools/vendor/sdk/
+steamtools/vendor/**/*.zip
+steamtools/vendor/**/*.dll
+steamtools/vendor/**/*.lib
+steamtools/vendor/**/*.dylib
+
+# steam_appid.txt generowany w runtime przez SteamClient
+steam_appid.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Build / packaging
+build/
+dist/
+packaging/tools/
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# System
+.DS_Store
