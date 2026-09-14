@@ -8,6 +8,17 @@ narzędzi **SAM (Steam Achievement Manager)** oraz **idle_master_extended**:
 
 Zbudowana na PyQt6 + PyQt6-Fluent-Widgets (sidebar, nowoczesny Fluent Design zamiast klasycznego WinForms).
 
+## Zrzuty ekranu
+
+| Biblioteka gier | Osiągnięcia |
+|:---:|:---:|
+| ![Biblioteka gier](docs/screenshots/library-view.png) | ![Widok osiągnięć](docs/screenshots/achievements-view.png) |
+
+| Ustawienia |
+|:---:|
+| ![Ustawienia](docs/screenshots/settings-view.png) |
+
+
 ## Dlaczego to działa natywnie na Linuksie (w przeciwieństwie do oryginałów)
 
 Oba oryginalne narzędzia (`idle_master_extended`, `SteamAchievementManager`)
@@ -136,6 +147,8 @@ chmod +x build/appimage/SteamTools-x86_64.AppImage
 ```
 build.sh                          # buduje .deb + AppImage w jednym kroku, wynik w dist/
 venv.sh / run.sh                  # patrz sekcja "Skrypty pomocnicze"
+docs/
+└── screenshots/                  # zrzuty ekranu użyte w tym README
 steamtools/
 ├── app.py                        # punkt wejścia
 ├── core/
