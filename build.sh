@@ -18,11 +18,30 @@
 # Użycie:
 #   ./build.sh [wersja]
 #
-# Domyślna wersja to 0.1.0, tak samo jak w packaging/build_deb.sh.
+# Numer wersji ma DOKŁADNIE jedno źródło prawdy: plik VERSION w korzeniu
+# repo. Ten sam plik czyta ui/views/about_view.py w runtime (przez
+# core/config.py: get_app_version()) do numeru pokazywanego w zakładce
+# Informacje. Bez tego dwa miejsca łatwo się rozjeżdżały: build.sh budował
+# "steamtools_0.1.2_amd64.deb", a appka w UI dalej twierdziła że jest
+# 0.1.0, bo VERSION nikt nie zaktualizował.
+#
+# - Bez argumentu: buduje z wersją, jaka aktualnie jest w pliku VERSION.
+# - Z argumentem (np. ./build.sh 0.1.2): NADPISUJE plik VERSION tą
+#   wartością PRZED buildem, więc świeżo zbudowana binarka i plik VERSION
+#   w repo są zawsze zgodne - nie trzeba robić tego ręcznie osobnym
+#   `echo "0.1.2" > VERSION` przed każdym buildem z nowym numerem.
 set -euo pipefail
 
-VERSION="${1:-0.1.0}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION_FILE="${ROOT_DIR}/VERSION"
+
+if [[ -n "${1:-}" ]]; then
+    VERSION="$1"
+    echo "${VERSION}" > "${VERSION_FILE}"
+    echo "==> Zapisano wersję ${VERSION} do ${VERSION_FILE}"
+else
+    VERSION="$(cat "${VERSION_FILE}" 2>/dev/null || echo "0.1.0")"
+fi
 PYINSTALLER_DIST_DIR="${ROOT_DIR}/dist"
 BUILD_DIR="${ROOT_DIR}/build"
 RELEASE_DIR="${ROOT_DIR}/dist"

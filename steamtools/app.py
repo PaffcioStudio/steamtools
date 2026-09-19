@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import multiprocessing as mp
 import sys
 
@@ -50,6 +51,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # faulthandler.enable() sprawia, że segfault ("Naruszenie ochrony
+    # pamięci") wypisuje na stderr Python-owy stack trace (który moduł/
+    # linia była wykonywana w momencie crasha) zamiast gołego komunikatu
+    # od jądra bez żadnego kontekstu. Bez tego debugowanie segfaultów w
+    # aplikacji PyQt6+ctypes (Steamworks SDK ładowane przez ctypes, patrz
+    # core/steamworks.py) sprowadza się do zgadywania - segfault z
+    # definicji omija normalną obsługę wyjątków Pythona.
+    faulthandler.enable()
     # KRYTYCZNE dla spakowanej binarki (PyInstaller --onedir, patrz
     # packaging/steamtools.spec i build_deb.sh): każdy proces idle
     # (steamtools/core/idler.py -> IdleManager, mp.get_context("spawn"))

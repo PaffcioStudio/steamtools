@@ -28,6 +28,13 @@ a = Analysis(
     binaries=binaries,
     datas=[
         (str(project_root / "steamtools" / "resources"), "steamtools/resources"),
+        # Plik VERSION jest jedynym źródłem prawdy dla numeru wersji
+        # pokazywanego w zakładce Informacje (patrz core/config.py:
+        # get_app_version()) - MUSI trafić do datas, inaczej
+        # get_app_version() w spakowanej binarce nie znajdzie go i spadnie
+        # na fallback "dev". Katalog docelowy "." (korzeń sys._MEIPASS) -
+        # get_app_version() szuka go właśnie tam w trybie frozen.
+        (str(project_root / "VERSION"), "."),
     ],
     hiddenimports=[
         "qfluentwidgets",

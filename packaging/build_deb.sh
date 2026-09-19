@@ -3,10 +3,14 @@
 # Wymaga: dpkg-deb (standardowo dostępny w Debianie/Ubuntu/pochodnych, w tym TuxedoOS).
 set -euo pipefail
 
-VERSION="${1:-0.1.0}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Domyślna wersja z pliku VERSION w korzeniu repo, TEGO SAMEGO co czyta
+# ui/views/about_view.py w runtime (core/config.py: get_app_version()) -
+# patrz komentarz w build.sh, który normalnie woła ten skrypt i przekazuje
+# VERSION dalej jako argument $1.
+VERSION="${1:-$(cat "${ROOT_DIR}/VERSION" 2>/dev/null || echo "0.1.0")}"
 ARCH="amd64"
 PKG_NAME="steamtools"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist/steamtools"
 BUILD_DIR="${ROOT_DIR}/build/deb"
 PKG_DIR="${BUILD_DIR}/${PKG_NAME}_${VERSION}_${ARCH}"

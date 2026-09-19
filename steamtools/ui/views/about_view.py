@@ -25,7 +25,9 @@ from qfluentwidgets import (
     IndeterminateProgressBar,
 )
 
-__version__ = "0.1.0"
+from steamtools.core.config import get_app_version
+
+__version__ = get_app_version()
 
 _REPO_URL = "https://github.com/PaffcioStudio/steamtools"
 _ROADMAP_FILE = "ROADMAP.md"

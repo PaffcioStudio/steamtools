@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +24,42 @@ def _config_dir() -> Path:
     xdg_config = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg_config) if xdg_config else Path.home() / ".config"
     return base / "steamtools"
+
+
+def _project_root() -> Path:
+    """Katalog, względem którego szukamy plików repo (VERSION, ROADMAP.md)
+    - NIE ~/.config, bo te pliki są częścią kodu/repo, nie stanu usera.
+    Dwie różne bazy zależnie od trybu uruchomienia:
+    - PyInstaller --onedir (patrz packaging/steamtools.spec): pliki z
+      `datas=[...]` lądują obok binarki, ścieżka do nich to sys._MEIPASS
+      (ustawiane przez sam PyInstaller w runtime, nie ma go przy zwykłym
+      `python -m steamtools.app`).
+    - Uruchomienie z kodu źródłowego (./run.sh, `python -m steamtools.app`):
+      ten plik siedzi w steamtools/core/config.py, więc korzeń repo jest
+      dwa poziomy wyżej."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass)
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def get_app_version() -> str:
+    """Wersja aplikacji z pliku VERSION w korzeniu repo - JEDYNE źródło
+    prawdy, żeby uniknąć dokładnie tego, co działo się wcześniej: build.sh
+    przyjmował numer wersji jako argument (do nazwy paczki .deb/AppImage),
+    ale sam kod Pythona (ui/views/about_view.py) miał wersję wpisaną na
+    sztywno osobnym literałem - zakładka Informacje pokazywała "0.1.0"
+    nawet gdy paczka nazywała się "steamtools_0.1.2_amd64.deb". Teraz
+    zarówno build.sh/build_deb.sh (przez `cat VERSION`), jak i ten kod w
+    runtime, czytają dokładnie ten sam plik.
+    "dev" jako fallback (plik nie istnieje/nie do odczytu) zamiast
+    wyjątku - lepiej pokazać coś niż wywalić całą zakładkę Informacje
+    z powodu brakującego pliku wersji."""
+    version_file = _project_root() / "VERSION"
+    try:
+        return version_file.read_text(encoding="utf-8").strip() or "dev"
+    except OSError:
+        return "dev"
 
 
 def _idle_queue_path() -> Path:
