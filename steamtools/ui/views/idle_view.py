@@ -155,6 +155,34 @@ class IdleView(QWidget):
     # prywatnej strony Badges.
     AUTO_CHECK_INTERVAL_SECONDS = 300
 
+    # Emitowany za KAŻDYM razem, gdy pojedyncza gra zostaje automatycznie
+    # zatrzymana z powodu wyczerpania kart (0 pozostałych) - niezależnie
+    # od tego, czy w tym samym momencie kończy się cała kolejka. MainWindow
+    # nasłuchuje tego sygnału, żeby pokazać powiadomienie na pulpicie
+    # (patrz ustawienie "Powiadomienie o wyczerpaniu kart w grze").
+    # Argument: nazwa gry.
+    gameCardsExhausted = pyqtSignal(str)
+
+    # Emitowany wyłącznie w momencie, gdy PO zatrzymaniu gry (z powodu
+    # wyczerpania kart) kolejka farmienia staje się całkowicie pusta - czyli
+    # to była ostatnia aktywnie/pauzowanie farmiona gra. Odróżnione od
+    # gameCardsExhausted, bo to dwa osobne ustawienia/powiadomienia: "ta
+    # gra skończyła karty" vs "całe farmienie się zakończyło".
+    allGamesFinished = pyqtSignal()
+
+    # Emitowany gdy user RĘCZNIE próbuje sprawdzić/dodać gry po kartach
+    # (przyciski "Sprawdź pozostałe karty" / "Sprawdź i dodaj wszystkie"),
+    # a konto Steam Community nie jest skonfigurowane albo zapisana sesja
+    # jest nieważna. MainWindow łapie to i pokazuje dialog z wyborem
+    # "Zarządzaj kontem" / "Zamknij" zamiast (albo obok) zwykłego InfoBara -
+    # to dokładnie ten sam problem co przy próbie farmienia z nieaktualnym
+    # steamLoginSecure, więc user od razu dostaje drogę do naprawy zamiast
+    # samego komunikatu o błędzie. NIE emitowany w trybie automatycznym
+    # (odpytywanie co 5 minut) - zasypywałoby usera tym samym dialogiem co
+    # AUTO_CHECK_INTERVAL_SECONDS, dokładnie to, czemu is_automatic już
+    # zapobiega dla zwykłych InfoBarów niżej.
+    accountProblemDetected = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("IdleView")
@@ -299,7 +327,20 @@ class IdleView(QWidget):
             )
         return True
 
-    def _on_stop(self, app_id: int) -> None:
+    def _on_stop(self, app_id: int, *, cards_exhausted: bool = False) -> None:
+        """Zatrzymuje farmienie danej gry. `cards_exhausted=True` oznacza,
+        że to auto-stop z powodu wyczerpania kart (wołane z
+        _on_badge_progress_ok) - wtedy, i tylko wtedy, emitujemy sygnały
+        powiadomień: zawsze gameCardsExhausted, a dodatkowo allGamesFinished
+        jeśli to była ostatnia gra w kolejce. Ręczne zatrzymanie przez usera
+        (przycisk X na karcie) nie generuje żadnych powiadomień - to jego
+        świadoma akcja, nie ma czego mu "zgłaszać"."""
+        name = None
+        if cards_exhausted:
+            card_before = self._cards.get(app_id)
+            if card_before:
+                name = card_before.title.text()
+
         self.manager.stop(app_id)
         card = self._cards.pop(app_id, None)
         if card:
@@ -316,6 +357,13 @@ class IdleView(QWidget):
         self._update_empty_state()
         self._update_count_label()
         self.manager.save_queue()
+
+        if cards_exhausted and name:
+            self.gameCardsExhausted.emit(name)
+            # Kolejka pusta PO zatrzymaniu tej gry - to była ostatnia,
+            # więc całe farmienie się właśnie zakończyło.
+            if not self._cards:
+                self.allGamesFinished.emit()
 
     def _on_pause(self, app_id: int) -> None:
         self.manager.pause(app_id)
@@ -395,20 +443,17 @@ class IdleView(QWidget):
     def _check_cards_remaining(self, is_automatic: bool = False) -> None:
         session = load_community_session()
         if not session.is_configured():
-            # W trybie automatycznym pomijamy InfoBar ostrzegawczy - bez
-            # tego zamęczałby usera co 5 minut, jeśli świadomie nie
+            # W trybie automatycznym pomijamy dialog/InfoBar ostrzegawczy -
+            # bez tego zamęczałby usera co 5 minut, jeśli świadomie nie
             # skonfigurował sesji Steam Community. Ręczne kliknięcie
             # przycisku to co innego: tam ostrzeżenie jest na miejscu, bo
             # user aktywnie próbuje coś zrobić i zasługuje na wyjaśnienie
-            # dlaczego nic się nie stało.
+            # dlaczego nic się nie stało - stąd też dialog z bezpośrednim
+            # skrótem do zakładki Konto, nie tylko gołe info.
             if not is_automatic:
-                InfoBar.warning(
-                    title="Brak konfiguracji Steam Community",
-                    content="Skonfiguruj SteamID64 i ciasteczko sesji w "
-                    "Ustawieniach, żeby sprawdzać liczbę pozostałych kart.",
-                    parent=self,
-                    position=InfoBarPosition.TOP,
-                    duration=5000,
+                self.accountProblemDetected.emit(
+                    "Żeby sprawdzić liczbę pozostałych kart, najpierw skonfiguruj "
+                    "ciasteczko sesji Steam Community w zakładce Konto."
                 )
             return
 
@@ -448,13 +493,9 @@ class IdleView(QWidget):
         siebie zastosowania."""
         session = load_community_session()
         if not session.is_configured():
-            InfoBar.warning(
-                title="Brak konfiguracji Steam Community",
-                content="Skonfiguruj SteamID64 i ciasteczko sesji w "
-                "Ustawieniach, żeby sprawdzać liczbę pozostałych kart.",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=5000,
+            self.accountProblemDetected.emit(
+                "Żeby sprawdzić liczbę pozostałych kart, najpierw skonfiguruj "
+                "ciasteczko sesji Steam Community w zakładce Konto."
             )
             return
 
@@ -539,7 +580,7 @@ class IdleView(QWidget):
 
             if remaining == 0:
                 name = card.title.text()
-                self._on_stop(app_id)
+                self._on_stop(app_id, cards_exhausted=True)
                 auto_stopped.append(name)
 
         # Zatrzymanie gry (auto_stopped) to zawsze istotna informacja, więc
@@ -571,17 +612,13 @@ class IdleView(QWidget):
         self.check_cards_btn.setEnabled(True)
         self.check_and_queue_btn.setEnabled(True)
         self.badge_progress_bar.setVisible(False)
-        # W trybie automatycznym pomijamy InfoBar błędu - błąd (np.
+        # W trybie automatycznym pomijamy dialog/InfoBar błędu - błąd (np.
         # wygasła sesja) i tak nie zniknie sam, a ponawianie tego samego
         # komunikatu co 5 minut byłoby uciążliwe. User i tak zobaczy błąd
         # przy najbliższym RĘCZNYM kliknięciu "Sprawdź pozostałe karty".
         if not is_automatic:
-            InfoBar.error(
-                title="Błąd Steam Community",
-                content=message,
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=6000,
+            self.accountProblemDetected.emit(
+                f"Steam odrzucił zapisaną sesję: {message}"
             )
 
     def prompt_resume_saved_queue(self) -> None:
@@ -627,6 +664,18 @@ class IdleView(QWidget):
             # już raz odrzuconą kolejkę.
             from steamtools.core.config import clear_idle_queue
             clear_idle_queue()
+
+    def has_active_jobs(self) -> bool:
+        """Czy w kolejce farmienia jest obecnie jakakolwiek gra (farmiona
+        aktywnie albo czekająca w kolejce). Używane przez MainWindow.closeEvent
+        do ostrzegania usera przed przerwaniem farmienia przyciskiem X."""
+        return bool(self._cards)
+
+    def active_jobs_count(self) -> int:
+        """Liczba gier obecnie w kolejce farmienia (aktywnych + oczekujących).
+        Używane wyłącznie do treści komunikatu ostrzegawczego w MainWindow -
+        has_active_jobs() powyżej wystarcza do samej decyzji tak/nie."""
+        return len(self._cards)
 
     def shutdown(self) -> None:
         # Zapisujemy stan PRZED zatrzymaniem procesów (stop_all czyści

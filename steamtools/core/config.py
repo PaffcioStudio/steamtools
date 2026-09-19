@@ -29,6 +29,16 @@ def _idle_queue_path() -> Path:
     return _config_dir() / "idle_queue.json"
 
 
+def settings_file_path() -> Path:
+    """Ścieżka pliku ustawień UI (motyw, tray, powiadomienia itd.),
+    zarządzanego przez QConfig z qfluentwidgets (ui/views/settings_view.py:
+    AppConfig). Osobna funkcja zamiast literału w settings_view.py, żeby
+    cała logika lokalizacji plików stanu aplikacji siedziała w jednym
+    miejscu (ten moduł), spójnie z idle_queue.json i community_session.json
+    poniżej."""
+    return _config_dir() / "settings.json"
+
+
 @dataclass
 class SavedIdleEntry:
     app_id: int

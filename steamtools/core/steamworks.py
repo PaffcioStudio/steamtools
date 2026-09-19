@@ -24,6 +24,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -301,6 +302,24 @@ class SteamClient:
         self._require_init()
         lib = self._lib
         count = lib.SteamAPI_ISteamUserStats_GetNumAchievements(self._user_stats)
+
+        # Zaraz po SteamAPI_InitFlat klient Steam synchronizuje statystyki
+        # gracza z serwerami W TLE, asynchronicznie - GetNumAchievements()
+        # potrafi więc zwrócić 0 przez ułamek sekundy do ~1-2s po starcie,
+        # zanim ta synchronizacja się skończy, mimo że gra i tak MA
+        # osiągnięcia (Steam po prostu jeszcze ich nie doniósł). Bez tego
+        # dociągania user widziałby pustą listę tylko przy "zimnym" starcie
+        # programu, a przy drugiej próbie (dane już zsynchronizowane i
+        # scache'owane po stronie klienta Steam) - kompletną listę, myląco
+        # sugerując losowość. Pompujemy callbacki i próbujemy ponownie kilka
+        # razy zamiast zwracać 0 od razu; jeśli po tym czasie WCIĄŻ jest 0,
+        # przyjmujemy że gra faktycznie nie ma osiągnięć.
+        attempts = 0
+        while count == 0 and attempts < 20:
+            lib.SteamAPI_RunCallbacks()
+            time.sleep(0.1)
+            count = lib.SteamAPI_ISteamUserStats_GetNumAchievements(self._user_stats)
+            attempts += 1
 
         results: list[AchievementInfo] = []
         for i in range(count):

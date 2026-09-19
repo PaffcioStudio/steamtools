@@ -75,8 +75,10 @@ mkdir -p "${RELEASE_DIR}"
 if [[ -f "${DEB_FILE}" ]]; then
     cp "${DEB_FILE}" "${RELEASE_DIR}/"
     echo "  -> dist/$(basename "${DEB_FILE}")"
+    RELEASE_DEB_FILE="${RELEASE_DIR}/$(basename "${DEB_FILE}")"
 else
     echo "  UWAGA: nie znaleziono ${DEB_FILE}, pomijam."
+    RELEASE_DEB_FILE=""
 fi
 
 if [[ -f "${APPIMAGE_FILE}" ]]; then
@@ -96,3 +98,23 @@ rm -rf "${BUILD_DIR}"
 echo ""
 echo "==> Gotowe. Zawartość dist/:"
 ls -la "${RELEASE_DIR}"
+
+if [[ -n "${RELEASE_DEB_FILE}" && -f "${RELEASE_DEB_FILE}" ]]; then
+    echo ""
+    # Domyślnie Tak - sam Enter (odpowiedź pusta) też instaluje, bo to
+    # najczęstsza ścieżka po lokalnym buildzie ("zbuduj i od razu wgraj
+    # na tę maszynę do testu"). Jedyne co blokuje instalację to jawne
+    # N/n. sudo jest tu wymagane przez dpkg (instalacja systemowa do
+    # /usr) - user zostanie zapytany o hasło przez samo sudo, nie trzeba
+    # tego dublować w tym skrypcie.
+    read -r -p "Zainstalować teraz $(basename "${RELEASE_DEB_FILE}") przez dpkg? [T/n] " INSTALL_ANSWER
+    case "${INSTALL_ANSWER,,}" in
+        n|nie|no)
+            echo "Pomijam instalację."
+            ;;
+        *)
+            echo "==> Instaluję: sudo dpkg --install ${RELEASE_DEB_FILE}"
+            sudo dpkg --install "${RELEASE_DEB_FILE}"
+            ;;
+    esac
+fi
