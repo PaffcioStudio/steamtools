@@ -30,6 +30,7 @@ from steamtools.core.idler import IdleManager, IdleState, IdleJob, MAX_CONCURREN
 from steamtools.core.badges import (
     fetch_badge_progress,
     SteamCommunityError,
+    SteamSessionExpiredError,
     BadgeProgress,
     format_cards_count,
     get_cached_badge_progress,
@@ -52,7 +53,9 @@ class _FetchBadgeProgressThread(QThread):
     zamrażałoby się na czas requestu (do kilku sekund przy wolnym łączu)."""
 
     finished_ok = pyqtSignal(list)  # list[BadgeProgress]
-    finished_error = pyqtSignal(str)
+    # (komunikat, session_expired) - session_expired=True tylko gdy Steam
+    # POTWIERDZIŁ, że sesja nie loguje; False = problem sieci/Steam.
+    finished_error = pyqtSignal(str, bool)
 
     def __init__(self, session_cookie: str, session_id: str, parent=None):
         super().__init__(parent)
@@ -62,9 +65,14 @@ class _FetchBadgeProgressThread(QThread):
     def run(self) -> None:
         try:
             results = fetch_badge_progress(self.session_cookie, self.session_id)
-            self.finished_ok.emit(results)
+        except SteamSessionExpiredError as exc:
+            self.finished_error.emit(str(exc), True)
         except SteamCommunityError as exc:
-            self.finished_error.emit(str(exc))
+            self.finished_error.emit(str(exc), False)
+        except Exception as exc:  # noqa: BLE001 - wątek nie może rzucić na zewnątrz
+            self.finished_error.emit(f"Nieoczekiwany błąd: {exc}", False)
+        else:
+            self.finished_ok.emit(results)
 
 
 class IdleJobCard(CardWidget):
@@ -183,9 +191,16 @@ class IdleView(QWidget):
     # zapobiega dla zwykłych InfoBarów niżej.
     accountProblemDetected = pyqtSignal(str)
 
+    # Emitowany, gdy Steam potwierdził wygaśnięcie sesji - także w trybie
+    # automatycznym (raz na "serię" wygaśnięcia, patrz _expired_notified),
+    # bo przy wielogodzinnym farmieniu token może paść w trakcie i user
+    # powinien się o tym dowiedzieć bez klikania czegokolwiek.
+    sessionExpiredDetected = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("IdleView")
+        self._expired_notified = False
         self.manager = IdleManager()
         self._cards: dict[int, IdleJobCard] = {}
         self._badge_thread: Optional[_FetchBadgeProgressThread] = None
@@ -471,7 +486,9 @@ class IdleView(QWidget):
             lambda results: self._on_badge_progress_ok(results, is_automatic=is_automatic)
         )
         self._badge_thread.finished_error.connect(
-            lambda message: self._on_badge_progress_error(message, is_automatic=is_automatic)
+            lambda message, expired: self._on_badge_progress_error(
+                message, expired, is_automatic=is_automatic
+            )
         )
         self._badge_thread.start()
         # Zawsze resetujemy licznik przy każdym sprawdzeniu (ręcznym albo
@@ -510,7 +527,11 @@ class IdleView(QWidget):
             session.session_cookie, session.session_id, self
         )
         self._badge_thread.finished_ok.connect(self._on_badge_progress_queue_all)
-        self._badge_thread.finished_error.connect(self._on_badge_progress_error)
+        self._badge_thread.finished_error.connect(
+            lambda message, expired: self._on_badge_progress_error(
+                message, expired, is_automatic=False
+            )
+        )
         self._badge_thread.start()
         # Ręczne sprawdzenie liczy się jak automatyczne - resetujemy
         # odliczanie, żeby za chwilę nie strzelić drugim requestem tuż po
@@ -524,6 +545,7 @@ class IdleView(QWidget):
         self.badge_progress_bar.setVisible(False)
 
         set_cached_badge_progress(results)
+        self._expired_notified = False
 
         added_names: list[str] = []
         for r in results:
@@ -566,6 +588,7 @@ class IdleView(QWidget):
         self.badge_progress_bar.setVisible(False)
 
         set_cached_badge_progress(results)
+        self._expired_notified = False
 
         by_app_id = {r.app_id: r.cards_remaining for r in results}
 
@@ -608,17 +631,42 @@ class IdleView(QWidget):
                 duration=3000,
             )
 
-    def _on_badge_progress_error(self, message: str, is_automatic: bool = False) -> None:
+    _SESSION_EXPIRED_TEXT = (
+        "Dane sesji Steam wygasły. Zaloguj się ponownie na steamcommunity.com "
+        "i wklej świeże ciasteczko steamLoginSecure w zakładce Konto."
+    )
+
+    def _on_badge_progress_error(
+        self, message: str, session_expired: bool, is_automatic: bool = False
+    ) -> None:
         self.check_cards_btn.setEnabled(True)
         self.check_and_queue_btn.setEnabled(True)
         self.badge_progress_bar.setVisible(False)
-        # W trybie automatycznym pomijamy dialog/InfoBar błędu - błąd (np.
-        # wygasła sesja) i tak nie zniknie sam, a ponawianie tego samego
-        # komunikatu co 5 minut byłoby uciążliwe. User i tak zobaczy błąd
-        # przy najbliższym RĘCZNYM kliknięciu "Sprawdź pozostałe karty".
+
+        if session_expired:
+            # Sesja martwa - przy automatycznym sprawdzaniu informujemy RAZ
+            # (nie co 5 minut), przy ręcznym zawsze, z dialogiem prowadzącym
+            # prosto do zakładki Konto. Farmienie trwających gier NIE jest
+            # przerywane - brak odpowiedzi to nie "0 kart pozostało".
+            if is_automatic:
+                if not self._expired_notified:
+                    self._expired_notified = True
+                    self.sessionExpiredDetected.emit(self._SESSION_EXPIRED_TEXT)
+            else:
+                self._expired_notified = True
+                self.accountProblemDetected.emit(self._SESSION_EXPIRED_TEXT)
+            return
+
+        # Problem sieci / throttling / nierozpoznana strona: to NIE jest
+        # problem z kontem, więc bez dialogu "Zarządzaj kontem". W trybie
+        # automatycznym milczymy (spróbujemy znów za 5 minut).
         if not is_automatic:
-            self.accountProblemDetected.emit(
-                f"Steam odrzucił zapisaną sesję: {message}"
+            InfoBar.error(
+                title="Nie udało się sprawdzić kart",
+                content=message,
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
             )
 
     def prompt_resume_saved_queue(self) -> None:

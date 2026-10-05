@@ -46,7 +46,25 @@ from bs4 import BeautifulSoup
 
 
 class SteamCommunityError(RuntimeError):
-    """Błąd komunikacji ze Steam Community (sesja wygasła, brak sieci, itp.)."""
+    """Ogólny błąd komunikacji ze Steam Community (brak sieci, throttling,
+    nierozpoznana strona itp.). NIE oznacza jeszcze, że sesja jest martwa -
+    do tego służy podklasa SteamSessionExpiredError."""
+
+
+class SteamSessionExpiredError(SteamCommunityError):
+    """Steam POTWIERDZIŁ, że podane steamLoginSecure nie loguje (wygasło,
+    zostało unieważnione albo ma zły format). Tylko ten wyjątek uprawnia UI
+    do twierdzenia "sesja wygasła" - przy zwykłym braku internetu czy
+    błędzie 5xx rzucamy SteamCommunityError, żeby nie straszyć usera (i nie
+    kasować mu ważnego ciasteczka) z powodu chwilowych problemów sieci."""
+
+
+@dataclass
+class SessionInfo:
+    """Wynik udanej weryfikacji sesji: do kogo należy ciasteczko."""
+
+    steam_id64: str
+    persona_name: Optional[str] = None
 
 
 @dataclass
@@ -146,32 +164,71 @@ def _build_badges_url(steam_id64: str) -> str:
     return f"https://steamcommunity.com/profiles/{steam_id64}/badges/?p=1"
 
 
-def fetch_badge_progress(session_cookie: str, session_id: str = "") -> list[BadgeProgress]:
-    """Pobiera i parsuje stronę Badges dla konta powiązanego z podanym
-    ciasteczkiem sesji (wszystkie gry z niewyzerowanymi dropami na raz -
-    jedno zapytanie HTTP zamiast N zapytań per gra, zgodnie z tym jak
-    robił to oryginalny idle_master_extended).
+_LOGGED_IN_ID_RE = re.compile(r"""g_steamID\s*=\s*["']?(\d{17})["']?""")
+_LOGGED_OUT_RE = re.compile(r"""g_steamID\s*=\s*(?:false|null|["']{2})""")
 
-    `session_cookie` to wartość ciasteczka "steamLoginSecure" skopiowana
-    przez użytkownika z przeglądarki po zalogowaniu na steamcommunity.com -
-    SteamID64 jest z niego wyciągane automatycznie (patrz
-    extract_steam_id64_from_cookie), user NIE musi go podawać osobno.
 
-    `session_id` to opcjonalna wartość ciasteczka "sessionid" (24-znakowy
-    hex token CSRF) - część requestów do Steam Community go wymaga.
-    Puste `session_id` zwykle wystarcza do samego odczytu strony Badges
-    (GET, nie POST), ale przyjmujemy je opcjonalnie na wypadek, gdyby
-    Steam zaczął tego wymagać także tutaj.
+def _detect_login_state(html: str) -> Optional[bool]:
+    """Rozpoznaje po HTML-u, czy Steam widzi nas jako ZALOGOWANYCH.
 
-    Strona Badges jest stronicowana (p=1, p=2, ...) - ta funkcja pobiera
-    tylko pierwszą stronę. Dociągnięcie kolejnych stron zostawione jako
-    rozszerzenie na przyszłość, gdyby ktoś miał bibliotekę na tyle dużą,
-    że gry z dropami nie mieszczą się na jednej stronie (rzadkie, bo
-    strona domyślnie pokazuje sporo pozycji na raz).
+    To jest sedno weryfikacji sesji. Samo to, że strona zawiera
+    `g_rgProfileData` albo `badge_row`, NIC nie dowodzi - te elementy są też
+    na publicznej stronie profilu oglądanej bez logowania (wtedy Steam po
+    prostu nie pokazuje dropów, które widzi tylko właściciel konta, i
+    scraper zwracał pustą listę, wyglądającą jak "brak kart").
+
+    Wiarygodne sygnały (nagłówek każdej strony Steam Community):
+      - zalogowany:    `g_steamID = "7656..."` oraz rozwijane menu konta
+                       `#account_pulldown` z nazwą użytkownika,
+      - niezalogowany: `g_steamID = false` oraz link do /login/.
+
+    Zwraca True/False, a None gdy nie widać żadnego z sygnałów (np. strona
+    konserwacyjna Steam albo zmiana układu) - wtedy NIE twierdzimy, że
+    sesja wygasła.
+    """
+    if _LOGGED_IN_ID_RE.search(html) or 'id="account_pulldown"' in html:
+        return True
+    if _LOGGED_OUT_RE.search(html):
+        return False
+    if "/login/home" in html or "global_action_link" in html:
+        return False
+    return None
+
+
+def _extract_persona_name(html: str) -> Optional[str]:
+    """Nazwa użytkownika z nagłówka strony - kilka selektorów po kolei, bo
+    to czysto kosmetyczna informacja (potwierdza userowi, że jest
+    zalogowany na właściwe konto); jej brak nie unieważnia sesji."""
+    soup = BeautifulSoup(html, "lxml")
+    for selector in (
+        "#account_pulldown",
+        ".profile_small_header_name a",
+        ".actual_persona_name",
+    ):
+        el = soup.select_one(selector)
+        if el is not None:
+            text = el.get_text(strip=True)
+            if text:
+                return text
+    return None
+
+
+def _load_badges_page(session_cookie: str, session_id: str = "") -> tuple[str, SessionInfo]:
+    """Pobiera stronę Badges konta i WERYFIKUJE, że Steam uznaje nas za
+    zalogowanych. Jedyne miejsce w programie, które robi to zapytanie -
+    zarówno scraping kart, jak i sprawdzanie sesji w zakładce Konto /
+    przy starcie idą tą samą drogą, więc nie da się już "sprawdzić kart"
+    na martwym ciasteczku i dostać pustego, mylącego wyniku.
+
+    Rzuca:
+      SteamSessionExpiredError - Steam potwierdził brak zalogowania
+                                 (albo ciasteczko ma zły format),
+      SteamCommunityError      - problem sieci/Steam, sesji nie dało się
+                                 ocenić (to NIE znaczy, że wygasła).
     """
     steam_id64 = extract_steam_id64_from_cookie(session_cookie)
     if steam_id64 is None:
-        raise SteamCommunityError(
+        raise SteamSessionExpiredError(
             "Nie udało się odczytać SteamID64 z ciasteczka steamLoginSecure - "
             "sprawdź, czy skopiowana wartość jest kompletna (format to "
             "<SteamID64>||<token>, np. 76561198012345678||A1B2C3...)."
@@ -194,25 +251,73 @@ def fetch_badge_progress(session_cookie: str, session_id: str = "") -> list[Badg
         with urllib.request.urlopen(request, timeout=10) as response:
             html = response.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise SteamSessionExpiredError(
+                f"Steam odrzucił ciasteczko (HTTP {exc.code})."
+            ) from exc
+        if exc.code == 429:
+            raise SteamCommunityError(
+                "Steam tymczasowo ogranicza liczbę zapytań (HTTP 429) - "
+                "spróbuj ponownie za kilka minut."
+            ) from exc
         raise SteamCommunityError(
-            f"Steam Community odpowiedziało błędem HTTP {exc.code} - "
-            f"sesja mogła wygasnąć, spróbuj zaktualizować ciasteczko "
-            f"w Ustawieniach."
+            f"Steam Community zwróciło błąd HTTP {exc.code} - "
+            f"spróbuj ponownie za chwilę."
         ) from exc
     except urllib.error.URLError as exc:
-        raise SteamCommunityError(f"Brak połączenia ze Steam Community: {exc.reason}") from exc
-
-    if "g_rgProfileData" not in html and "badge_row" not in html:
-        # Strona logowania zamiast strony badges - ciasteczko nieprawidłowe
-        # albo wygasłe. Rozpoznajemy to po braku charakterystycznych
-        # fragmentów, które zawsze są obecne na prawdziwej stronie badges
-        # zalogowanego użytkownika.
         raise SteamCommunityError(
-            "Nie rozpoznano strony Badges w odpowiedzi - ciasteczko sesji "
-            "jest prawdopodobnie nieprawidłowe lub wygasłe. Zaktualizuj je "
-            "w Ustawieniach."
+            f"Brak połączenia ze Steam Community: {exc.reason}"
+        ) from exc
+    except (TimeoutError, OSError) as exc:
+        raise SteamCommunityError(f"Brak połączenia ze Steam Community: {exc}") from exc
+
+    logged_in = _detect_login_state(html)
+    if logged_in is False:
+        raise SteamSessionExpiredError(
+            "Steam nie rozpoznaje tego ciasteczka jako zalogowanej sesji "
+            "(wygasło albo zostało unieważnione)."
+        )
+    if logged_in is None:
+        raise SteamCommunityError(
+            "Nie rozpoznano odpowiedzi Steam Community (strona konserwacyjna "
+            "albo zmieniony układ strony) - nie da się ocenić, czy sesja "
+            "jest ważna. Spróbuj ponownie później."
         )
 
+    return html, SessionInfo(steam_id64=steam_id64, persona_name=_extract_persona_name(html))
+
+
+def verify_session(session_cookie: str, session_id: str = "") -> SessionInfo:
+    """Sprawdza, czy ciasteczko steamLoginSecure FAKTYCZNIE loguje, i zwraca
+    SteamID64 oraz nazwę użytkownika (do pokazania w zakładce Konto).
+    Wyjątki jak w _load_badges_page."""
+    _html, info = _load_badges_page(session_cookie, session_id)
+    return info
+
+
+def fetch_badge_progress(session_cookie: str, session_id: str = "") -> list[BadgeProgress]:
+    """Pobiera i parsuje stronę Badges dla konta powiązanego z podanym
+    ciasteczkiem sesji (wszystkie gry z niewyzerowanymi dropami na raz -
+    jedno zapytanie HTTP zamiast N zapytań per gra, zgodnie z tym jak
+    robił to oryginalny idle_master_extended).
+
+    `session_cookie` to wartość ciasteczka "steamLoginSecure" skopiowana
+    przez użytkownika z przeglądarki po zalogowaniu na steamcommunity.com -
+    SteamID64 jest z niego wyciągane automatycznie (patrz
+    extract_steam_id64_from_cookie), user NIE musi go podawać osobno.
+
+    `session_id` to opcjonalna wartość ciasteczka "sessionid" (24-znakowy
+    hex token CSRF) - puste zwykle wystarcza do samego odczytu strony
+    Badges (GET, nie POST).
+
+    Gdy sesja jest martwa, rzuca SteamSessionExpiredError ZAMIAST zwracać
+    pustą listę - pusta lista oznacza wyłącznie "zalogowany, ale żadna gra
+    nie ma już dropów".
+
+    Strona Badges jest stronicowana (p=1, p=2, ...) - pobieramy tylko
+    pierwszą stronę. Dociągnięcie kolejnych zostawione jako rozszerzenie.
+    """
+    html, _info = _load_badges_page(session_cookie, session_id)
     return _parse_badges_html(html)
 
 

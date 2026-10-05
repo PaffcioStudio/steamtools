@@ -34,8 +34,10 @@ from qfluentwidgets import (
 
 from steamtools.core.badges import (
     extract_steam_id64_from_cookie,
-    fetch_badge_progress,
+    verify_session,
+    SessionInfo,
     SteamCommunityError,
+    SteamSessionExpiredError,
 )
 from steamtools.core.config import (
     CommunitySession,
@@ -46,14 +48,17 @@ from steamtools.core.config import (
 
 
 class _ValidateSessionThread(QThread):
-    """Próba pobrania strony Badges w osobnym wątku, żeby sprawdzić czy
-    zapisane steamLoginSecure faktycznie jeszcze loguje - bez blokowania
-    UI na czas requestu. Sukces (nawet pusta lista odznak) = sesja ważna;
-    SteamCommunityError = sesja wygasła/błędna (Steam zwrócił stronę
-    logowania zamiast Badges)."""
+    """Weryfikacja sesji w osobnym wątku (UI nie blokuje się na czas
+    requestu). Trzy możliwe wyniki, celowo rozdzielone:
+      verified   - Steam potwierdził zalogowanie (dostajemy SessionInfo),
+      expired    - Steam potwierdził, że ciasteczko NIE loguje,
+      unverified - nie dało się ocenić (brak sieci, throttling, ...) -
+                   to NIE jest dowód, że sesja wygasła.
+    """
 
-    finished_ok = pyqtSignal()
-    finished_error = pyqtSignal(str)
+    verified = pyqtSignal(object)  # SessionInfo
+    expired = pyqtSignal(str)
+    unverified = pyqtSignal(str)
 
     def __init__(self, session_cookie: str, session_id: str, parent=None):
         super().__init__(parent)
@@ -62,13 +67,28 @@ class _ValidateSessionThread(QThread):
 
     def run(self) -> None:
         try:
-            fetch_badge_progress(self.session_cookie, self.session_id)
-            self.finished_ok.emit()
+            info = verify_session(self.session_cookie, self.session_id)
+        except SteamSessionExpiredError as exc:
+            self.expired.emit(str(exc))
         except SteamCommunityError as exc:
-            self.finished_error.emit(str(exc))
+            self.unverified.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001 - wątek nie może rzucić na zewnątrz
+            self.unverified.emit(f"Nieoczekiwany błąd: {exc}")
+        else:
+            self.verified.emit(info)
 
 
 class AccountView(QWidget):
+    # Emitowane przy weryfikacji ZAPISANEJ sesji w tle (start programu).
+    # Zakładka Konto jest wtedy zwykle niewidoczna, więc InfoBar z tego
+    # widoku nigdy nie trafiłby do usera - komunikat pokazuje MainWindow.
+    sessionExpired = pyqtSignal(str)
+    sessionVerified = pyqtSignal(object)  # SessionInfo
+
+    _MODE_SAVE = "save"        # klik "Zapisz": zapisz dopiero po weryfikacji
+    _MODE_CHECK = "check"      # klik "Sprawdź sesję": tylko sprawdź
+    _MODE_STARTUP = "startup"  # tło przy starcie: tylko sprawdź zapisane
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("AccountView")
@@ -192,10 +212,13 @@ class AccountView(QWidget):
 
         buttons_row = QHBoxLayout()
         self.save_session_btn = PrimaryPushButton("Zapisz", card, FluentIcon.SAVE)
+        self.check_session_btn = PushButton("Sprawdź sesję", card, FluentIcon.SYNC)
         self.clear_session_btn = PushButton("Wyczyść", card, FluentIcon.DELETE)
         self.save_session_btn.clicked.connect(self._save_community_session)
+        self.check_session_btn.clicked.connect(self._check_session_clicked)
         self.clear_session_btn.clicked.connect(self._clear_community_session)
         buttons_row.addWidget(self.save_session_btn)
+        buttons_row.addWidget(self.check_session_btn)
         buttons_row.addWidget(self.clear_session_btn)
         buttons_row.addStretch(1)
         layout.addLayout(buttons_row)
@@ -208,18 +231,53 @@ class AccountView(QWidget):
         self.session_check_bar.setVisible(False)
         layout.addWidget(self.session_check_bar)
 
+        # Stały status sesji - wynik OSTATNIEJ prawdziwej weryfikacji u Steam
+        # (nie samego formatu ciasteczka, który pokazuje wiersz wyżej).
+        status_row = QHBoxLayout()
+        status_row.setSpacing(6)
+        self.status_icon = IconWidget(FluentIcon.INFO, card)
+        self.status_icon.setFixedSize(16, 16)
+        status_row.addWidget(self.status_icon)
+        self.status_label = BodyLabel("", card)
+        self.status_label.setWordWrap(True)
+        status_row.addWidget(self.status_label, stretch=1)
+        layout.addLayout(status_row)
+        self._set_status(
+            "unknown",
+            "Sesja nie była jeszcze sprawdzona." if saved.session_cookie
+            else "Brak zapisanej sesji.",
+        )
+
         self._validate_thread: _ValidateSessionThread | None = None
+        self._pending_mode: str = self._MODE_CHECK
+        self._pending_cookie: str = ""
+        self._pending_session_id: str = ""
 
         wrapper_layout.addWidget(card)
 
-        # Jeśli sesja była już zapisana z poprzedniego uruchomienia programu,
-        # sprawdź od razu przy otwarciu zakładki Konto czy steamLoginSecure
-        # wciąż jest ważne - zamiast czekać, aż user sam zauważy błąd
-        # dopiero przy próbie farmienia/sprawdzania osiągnięć.
-        if saved.session_cookie:
-            self._validate_session_in_background(saved.session_cookie, saved.session_id)
-
         return wrapper
+
+    def _set_status(self, kind: str, text: str) -> None:
+        icon, color = {
+            "valid": (FluentIcon.ACCEPT, "#2ecc71"),
+            "expired": (FluentIcon.CLOSE, "#e74c3c"),
+            "unknown": (FluentIcon.INFO, "#95a5a6"),
+        }[kind]
+        self.status_icon.setIcon(icon)
+        self.status_label.setText(text)
+        self.status_label.setTextColor(color, color)
+
+    def verify_saved_session(self) -> None:
+        """Wołane przez MainWindow raz po starcie: jeśli jest zapisane
+        steamLoginSecure, od razu sprawdza u Steam, czy wciąż loguje -
+        user dowiaduje się o wygaśnięciu na wejściu, a nie dopiero gdy
+        "Sprawdź i farm wszystkie" zwróci nic."""
+        saved = load_community_session()
+        if not saved.is_configured():
+            return
+        self._start_verification(
+            saved.session_cookie, saved.session_id, self._MODE_STARTUP
+        )
 
     def _update_detected_steam_id(self, *_args) -> None:
         cookie = self.session_cookie_input.text().strip()
@@ -267,66 +325,148 @@ class AccountView(QWidget):
             )
             return
 
-        save_community_session(
-            CommunitySession(session_cookie=cookie, session_id=session_id)
-        )
-        InfoBar.success(
-            title="Zapisano",
-            content="Dane sesji Steam Community zostały zapisane.",
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=3000,
-        )
+        # Poprawny FORMAT nie znaczy, że token loguje - zapisujemy dopiero
+        # po tym, jak Steam potwierdzi zalogowanie (patrz _on_verified).
+        self._start_verification(cookie, session_id, self._MODE_SAVE)
 
-        # Format ciasteczka jest OK (steam_id64 wykryty powyżej), ale to
-        # nie znaczy że sam token wciąż loguje - sprawdzamy to naprawdę,
-        # w tle, żeby nie blokować UI na czas requestu do Steam Community.
-        self._validate_session_in_background(cookie, session_id)
+    def _check_session_clicked(self) -> None:
+        cookie = self.session_cookie_input.text().strip()
+        session_id = self.session_id_input.text().strip()
+        if not cookie:
+            InfoBar.warning(
+                title="Brak ciasteczka",
+                content="Wklej wartość ciasteczka steamLoginSecure.",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+            )
+            return
+        self._start_verification(cookie, session_id, self._MODE_CHECK)
 
-    def _validate_session_in_background(self, cookie: str, session_id: str) -> None:
-        # Gdyby poprzednia walidacja jeszcze trwała (np. user zdążył
-        # kliknąć Zapisz drugi raz zanim pierwszy request wrócił) - nie
-        # startujemy drugiego wątku równolegle, tylko czekamy aż poprzedni
-        # się zakończy (Qt i tak by odrzucił start już uruchomionego QThread).
+    def _start_verification(self, cookie: str, session_id: str, mode: str) -> None:
+        # Poprzednia weryfikacja jeszcze trwa - nie startujemy drugiej
+        # równolegle (przyciski są wtedy i tak zablokowane; to zabezpieczenie
+        # dotyczy głównie startu w tle zbiegającego się z kliknięciem).
         if self._validate_thread is not None and self._validate_thread.isRunning():
             return
 
+        self._pending_mode = mode
+        self._pending_cookie = cookie
+        self._pending_session_id = session_id
+
         self.session_check_bar.setVisible(True)
+        self.save_session_btn.setEnabled(False)
+        self.check_session_btn.setEnabled(False)
+        self._set_status("unknown", "Sprawdzanie sesji u Steam...")
+
         self._validate_thread = _ValidateSessionThread(cookie, session_id, self)
-        self._validate_thread.finished_ok.connect(self._on_session_valid)
-        self._validate_thread.finished_error.connect(self._on_session_invalid)
+        self._validate_thread.verified.connect(self._on_verified)
+        self._validate_thread.expired.connect(self._on_expired)
+        self._validate_thread.unverified.connect(self._on_unverified)
         self._validate_thread.start()
 
-    def _on_session_valid(self) -> None:
+    def _finish_verification_ui(self) -> None:
         self.session_check_bar.setVisible(False)
+        self.save_session_btn.setEnabled(True)
+        self.check_session_btn.setEnabled(True)
 
-    def _on_session_invalid(self, error: str) -> None:
-        self.session_check_bar.setVisible(False)
+    def _on_verified(self, info: SessionInfo) -> None:
+        self._finish_verification_ui()
 
-        # Zapisane dane już nie działają - czyścimy je od razu, żeby user
-        # nie farmił/sprawdzał osiągnięć "na ślepo" z martwym tokenem i mógł
-        # od razu wkleić nowe steamLoginSecure w puste pola.
-        clear_community_session()
-        self.session_cookie_input.clear()
-        self.session_id_input.clear()
-        self._update_detected_steam_id()
+        who = info.persona_name or "nieznana nazwa"
+        self._set_status(
+            "valid",
+            f"Sesja ważna - zalogowano jako {who} (SteamID64: {info.steam_id64}).",
+        )
 
+        if self._pending_mode == self._MODE_SAVE:
+            save_community_session(
+                CommunitySession(
+                    session_cookie=self._pending_cookie,
+                    session_id=self._pending_session_id,
+                )
+            )
+            InfoBar.success(
+                title="Zapisano",
+                content=f"Zalogowano jako {who}. Dane sesji zostały zapisane.",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+            )
+        elif self._pending_mode == self._MODE_CHECK:
+            InfoBar.success(
+                title="Sesja ważna",
+                content=f"Steam rozpoznaje to ciasteczko - konto: {who}.",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3500,
+            )
+        self.sessionVerified.emit(info)
+
+    def _on_expired(self, error: str) -> None:
+        self._finish_verification_ui()
+        self._set_status(
+            "expired",
+            "Sesja wygasła lub jest nieprawidłowa - zaloguj się ponownie na "
+            "steamcommunity.com i wklej świeże ciasteczko steamLoginSecure.",
+        )
+
+        # Pól NIE czyścimy: gdyby Steam kiedyś zmienił stronę i weryfikacja
+        # dała fałszywy alarm, user nie straciłby ważnego ciasteczka. Martwy
+        # token i tak nadpisuje się jednym wklejeniem.
+        if self._pending_mode == self._MODE_STARTUP:
+            self.sessionExpired.emit(error)
+            return
+
+        title = (
+            "Nie zapisano - sesja nieważna"
+            if self._pending_mode == self._MODE_SAVE
+            else "Sesja Steam wygasła"
+        )
         InfoBar.error(
-            title="Sesja Steam wygasła",
-            content=(
-                "Nie udało się zalogować przy użyciu zapisanego "
-                "steamLoginSecure - Steam odrzucił token. Pola zostały "
-                f"wyczyszczone, wklej nowe dane. ({error})"
-            ),
+            title=title,
+            content=f"{error} Zaloguj się ponownie i wklej nowe ciasteczko.",
             parent=self,
             position=InfoBarPosition.TOP,
             duration=8000,
         )
 
+    def _on_unverified(self, error: str) -> None:
+        self._finish_verification_ui()
+        self._set_status("unknown", f"Nie udało się sprawdzić sesji: {error}")
+
+        if self._pending_mode == self._MODE_STARTUP:
+            return  # cicho - to nie jest dowód problemu z sesją
+
+        if self._pending_mode == self._MODE_SAVE:
+            # Brak sieci nie powinien blokować zapisu - format jest poprawny.
+            save_community_session(
+                CommunitySession(
+                    session_cookie=self._pending_cookie,
+                    session_id=self._pending_session_id,
+                )
+            )
+            InfoBar.warning(
+                title="Zapisano, ale nie zweryfikowano",
+                content=f"Nie udało się sprawdzić sesji u Steam: {error}",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
+        else:
+            InfoBar.warning(
+                title="Nie udało się sprawdzić sesji",
+                content=error,
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
+
     def _clear_community_session(self) -> None:
         clear_community_session()
         self.session_cookie_input.clear()
         self.session_id_input.clear()
+        self._set_status("unknown", "Brak zapisanej sesji.")
         InfoBar.info(
             title="Wyczyszczono",
             content="Dane sesji Steam Community zostały usunięte.",

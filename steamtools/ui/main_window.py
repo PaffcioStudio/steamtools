@@ -21,6 +21,7 @@ from qfluentwidgets import (
     SubtitleLabel,
     BodyLabel,
     PrimaryPushButton,
+    PushButton,
 )
 
 from steamtools.core.steamworks import is_steam_running
@@ -216,6 +217,12 @@ class MainWindow(FluentWindow):
         self.idle_view.allGamesFinished.connect(self._on_all_games_finished)
         self.idle_view.accountProblemDetected.connect(self._on_account_problem)
 
+        # Wygaśnięcie sesji Steam wykryte w tle: przy starcie (weryfikacja
+        # zapisanego steamLoginSecure w AccountView) albo w trakcie pracy
+        # (automatyczne sprawdzanie kart w IdleView).
+        self.account_view.sessionExpired.connect(self._on_session_expired)
+        self.idle_view.sessionExpiredDetected.connect(self._on_session_expired)
+
         # Przycisk "Otwórz" w sekcji "O aplikacji" (Ustawienia) -> przełącz
         # na pełną zakładkę Informacje zamiast dublować jej zawartość tutaj.
         self.settings_view.openAboutRequested.connect(
@@ -236,6 +243,9 @@ class MainWindow(FluentWindow):
         # środku) wymaga w pełni zainicjalizowanej geometrii okna rodzica,
         # a to nie jest jeszcze pewne w trakcie samego __init__.
         QTimer.singleShot(0, self.idle_view.prompt_resume_saved_queue)
+        # Sprawdzenie zapisanej sesji Steam w tle (jeśli jest skonfigurowana) -
+        # asynchroniczne, więc nie opóźnia startu okna.
+        QTimer.singleShot(0, self.account_view.verify_saved_session)
 
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._tray_icon.show()
@@ -394,6 +404,24 @@ class MainWindow(FluentWindow):
         box.cancelButton.setText("Zamknij")
         if box.exec():
             self.switchTo(self.account_view)
+
+    def _on_session_expired(self, _message: str = "") -> None:
+        """Steam potwierdził, że zapisane steamLoginSecure już nie loguje.
+        Nie-modalny, trwały pasek (nie dialog), żeby nie kolidował np. z
+        pytaniem o wznowienie kolejki przy starcie; z przyciskiem
+        prowadzącym od razu do zakładki Konto."""
+        bar = InfoBar.error(
+            title="Sesja Steam wygasła",
+            content="Zaloguj się ponownie na steamcommunity.com i wklej nowe "
+            "ciasteczko steamLoginSecure w zakładce Konto.",
+            isClosable=True,
+            duration=-1,
+            position=InfoBarPosition.TOP,
+            parent=self,
+        )
+        go_btn = PushButton("Przejdź do Konta")
+        go_btn.clicked.connect(lambda: (self.switchTo(self.account_view), bar.close()))
+        bar.addWidget(go_btn)
 
     def _show_desktop_notification(self, title: str, message: str) -> None:
         """Pokazuje natywne powiadomienie systemowe przez ikonkę traya -
