@@ -33,6 +33,15 @@ class InstalledGame:
     size_on_disk: int = 0
 
 
+@dataclass
+class LibraryGame:
+    """Pozycja w widoku Biblioteka: gra z konta, zainstalowana lub nie."""
+
+    app_id: int
+    name: str
+    installed: bool = True
+
+
 # ---------------------------------------------------------------------- #
 # Filtrowanie narzędzi systemowych Steam (nie są "grami")
 # ---------------------------------------------------------------------- #
@@ -307,6 +316,23 @@ def scan_installed_games() -> list[InstalledGame]:
             unique_games.append(game)
 
     return unique_games
+
+
+def merge_library(
+    installed: list[InstalledGame], owned: list[tuple[int, str]]
+) -> list[LibraryGame]:
+    """Łączy gry zainstalowane (z dysku) z pełną listą z konta. Gra
+    zainstalowana zawsze dostaje nazwę z manifestu; gry tylko z konta
+    dostają installed=False. Zainstalowane gry nieobecne na liście z konta
+    (np. Family Sharing albo nieaktualny cache) zostają na liście."""
+    by_id: dict[int, LibraryGame] = {}
+    for app_id, name in owned:
+        if _is_steam_tool(app_id, name):
+            continue
+        by_id[app_id] = LibraryGame(app_id=app_id, name=name, installed=False)
+    for game in installed:
+        by_id[game.app_id] = LibraryGame(app_id=game.app_id, name=game.name, installed=True)
+    return sorted(by_id.values(), key=lambda g: g.name.lower())
 
 
 def find_running_steam_pid() -> int | None:

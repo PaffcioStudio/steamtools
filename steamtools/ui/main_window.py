@@ -25,6 +25,7 @@ from qfluentwidgets import (
 )
 
 from steamtools.core.steamworks import is_steam_running
+from steamtools.ui.components.banner import MessageBanner
 from steamtools.ui.views.library_view import LibraryView
 from steamtools.ui.views.achievements_view import AchievementsView
 from steamtools.ui.views.idle_view import IdleView
@@ -222,6 +223,10 @@ class MainWindow(FluentWindow):
         # (automatyczne sprawdzanie kart w IdleView).
         self.account_view.sessionExpired.connect(self._on_session_expired)
         self.idle_view.sessionExpiredDetected.connect(self._on_session_expired)
+        self.library_view.sessionExpiredDetected.connect(self._on_session_expired)
+        # Sesja potwierdzona (start albo świeżo wklejone ciasteczko): chowamy
+        # ewentualny pasek "sesja wygasła" i dociągamy listę gier z konta.
+        self.account_view.sessionVerified.connect(self._on_session_verified)
 
         # Przycisk "Otwórz" w sekcji "O aplikacji" (Ustawienia) -> przełącz
         # na pełną zakładkę Informacje zamiast dublować jej zawartość tutaj.
@@ -271,8 +276,10 @@ class MainWindow(FluentWindow):
         candidates = [
             getattr(self.account_view, "_validate_thread", None),
             getattr(self.achievements_view, "_thread", None),
+            getattr(self.achievements_view, "_store_thread", None),
             getattr(self.idle_view, "_badge_thread", None),
             getattr(self.library_view, "_badge_thread", None),
+            getattr(self.library_view, "_owned_thread", None),
             getattr(self.about_view, "_update_thread", None),
         ]
         for thread in candidates:
@@ -409,19 +416,45 @@ class MainWindow(FluentWindow):
         """Steam potwierdził, że zapisane steamLoginSecure już nie loguje.
         Nie-modalny, trwały pasek (nie dialog), żeby nie kolidował np. z
         pytaniem o wznowienie kolejki przy starcie; z przyciskiem
-        prowadzącym od razu do zakładki Konto."""
-        bar = InfoBar.error(
-            title="Sesja Steam wygasła",
-            content="Zaloguj się ponownie na steamcommunity.com i wklej nowe "
-            "ciasteczko steamLoginSecure w zakładce Konto.",
-            isClosable=True,
-            duration=-1,
-            position=InfoBarPosition.TOP,
-            parent=self,
-        )
-        go_btn = PushButton("Przejdź do Konta")
-        go_btn.clicked.connect(lambda: (self.switchTo(self.account_view), bar.close()))
-        bar.addWidget(go_btn)
+        prowadzącym od razu do zakładki Konto. Jeden pasek na raz - kilka
+        widoków może wykryć wygaśnięcie niemal jednocześnie, a nie ma sensu
+        stackować identycznych komunikatów."""
+        banner = getattr(self, "_session_banner", None)
+        if banner is not None and not banner.isHidden():
+            return
+
+        if banner is None:
+            banner = MessageBanner(
+                "Sesja Steam wygasła",
+                "Zaloguj się ponownie na steamcommunity.com i wklej nowe "
+                "ciasteczko steamLoginSecure w zakładce Konto.",
+                "Przejdź do Konta",
+                self,
+                top_offset=lambda: self.titleBar.height(),
+            )
+            banner.actionClicked.connect(self._on_session_banner_action)
+            self._session_banner = banner
+
+        banner.show()
+        banner.reposition()
+
+    def _on_session_verified(self, _info=None) -> None:
+        banner = getattr(self, "_session_banner", None)
+        if banner is not None and not banner.isHidden():
+            banner.dismiss()
+        self.library_view.refresh_owned_games()
+
+    def _on_session_banner_action(self) -> None:
+        self.switchTo(self.account_view)
+        self._session_banner.dismiss()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        # Pasek sesji musi śledzić szerokość okna - zawija tekst do
+        # aktualnej szerokości zamiast wystawać poza krawędź.
+        banner = getattr(self, "_session_banner", None)
+        if banner is not None and not banner.isHidden():
+            banner.reposition()
 
     def _show_desktop_notification(self, title: str, message: str) -> None:
         """Pokazuje natywne powiadomienie systemowe przez ikonkę traya -

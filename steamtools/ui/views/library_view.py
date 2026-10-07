@@ -1,4 +1,4 @@
-"""Widok "Biblioteka" - lista zainstalowanych gier, punkt wejścia do
+"""Widok "Biblioteka" - lista gier z konta (zainstalowanych i nie), punkt wejścia do
 achievementów i idle dla konkretnej gry.
 
 Uwaga wydajnościowa: biblioteki rzędu 100-200+ gier (typowe przy kilku
@@ -57,16 +57,23 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
-from steamtools.core.library import scan_installed_games, InstalledGame
+from steamtools.core.library import scan_installed_games, merge_library, LibraryGame
+from steamtools.core.owned import fetch_owned_games
 from steamtools.core.badges import (
     fetch_badge_progress,
+    extract_steam_id64_from_cookie,
     SteamCommunityError,
+    SteamSessionExpiredError,
     BadgeProgress,
     format_cards_count,
     get_cached_badge_progress,
     set_cached_badge_progress,
 )
-from steamtools.core.config import load_community_session
+from steamtools.core.config import (
+    load_community_session,
+    load_owned_games_cache,
+    save_owned_games_cache,
+)
 
 _ROW_HEIGHT = 64
 _BTN_WIDTH = 130
@@ -80,7 +87,7 @@ _CardsRemainingRole = Qt.ItemDataRole.UserRole + 2
 
 
 class GameListModel(QAbstractListModel):
-    """Prosty model trzymający listę InstalledGame - żadnej logiki poza
+    """Prosty model trzymający listę LibraryGame - żadnej logiki poza
     ekspozycją danych, cały ciężar renderowania jest w delegate.
 
     Dodatkowo trzyma mapę app_id -> liczba pozostałych kart (None = nie
@@ -88,9 +95,9 @@ class GameListModel(QAbstractListModel):
     gier bez dropów - to jest realizacja wymogu "nie pozwalaj farmić gier
     bez kart do zdobycia"."""
 
-    def __init__(self, games: list[InstalledGame] | None = None, parent=None):
+    def __init__(self, games: list[LibraryGame] | None = None, parent=None):
         super().__init__(parent)
-        self._games: list[InstalledGame] = games or []
+        self._games: list[LibraryGame] = games or []
         self._cards_remaining: dict[int, int] = {}
         self._cards_checked: bool = False
 
@@ -111,7 +118,7 @@ class GameListModel(QAbstractListModel):
             return self._cards_remaining.get(game.app_id, 0)
         return None
 
-    def set_games(self, games: list[InstalledGame]) -> None:
+    def set_games(self, games: list[LibraryGame]) -> None:
         self.beginResetModel()
         self._games = games
         self.endResetModel()
@@ -135,7 +142,7 @@ class GameListModel(QAbstractListModel):
         bo brak danych)."""
         return self._cards_checked
 
-    def game_at(self, row: int) -> InstalledGame | None:
+    def game_at(self, row: int) -> LibraryGame | None:
         if 0 <= row < len(self._games):
             return self._games[row]
         return None
@@ -158,7 +165,7 @@ class GameRowDelegate(QStyledItemDelegate):
         return QSize(0, _ROW_HEIGHT)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
-        game: InstalledGame = index.data(_GameIdRole)
+        game: LibraryGame = index.data(_GameIdRole)
         if game is None:
             return
         cards_remaining = index.data(_CardsRemainingRole)  # None = nie sprawdzano, int = sprawdzono
@@ -200,6 +207,8 @@ class GameRowDelegate(QStyledItemDelegate):
         painter.setPen(subtitle_color)
         subtitle_rect = QRect(left_x, rect.top() + 30, text_right - left_x, 16)
         subtitle_text = f"AppID {game.app_id}"
+        if not game.installed:
+            subtitle_text += " - niezainstalowana"
         if cards_remaining is not None:
             subtitle_text += f" - {format_cards_count(cards_remaining)}"
         painter.drawText(subtitle_rect, Qt.AlignmentFlag.AlignVCenter, subtitle_text)
@@ -350,18 +359,46 @@ class _FetchBadgeProgressThread(QThread):
             self.finished_error.emit(str(exc))
 
 
+class _FetchOwnedGamesThread(QThread):
+    """Pobranie pełnej listy gier z konta (Steam Community) w tle."""
+
+    finished_ok = pyqtSignal(str, list)  # steam_id64, list[OwnedGame]
+    session_expired = pyqtSignal(str)
+    finished_error = pyqtSignal(str)
+
+    def __init__(self, session_cookie: str, session_id: str, parent=None):
+        super().__init__(parent)
+        self.session_cookie = session_cookie
+        self.session_id = session_id
+
+    def run(self) -> None:
+        try:
+            steam_id64, games = fetch_owned_games(self.session_cookie, self.session_id)
+        except SteamSessionExpiredError as exc:
+            self.session_expired.emit(str(exc))
+        except SteamCommunityError as exc:
+            self.finished_error.emit(str(exc))
+        else:
+            self.finished_ok.emit(steam_id64, games)
+
+
 class LibraryView(QWidget):
     """Widok listy gier z paskiem wyszukiwania nad nią."""
 
     achievementsRequested = pyqtSignal(int, str)
     idleRequested = pyqtSignal(int, str)
+    sessionExpiredDetected = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("LibraryView")
-        self._all_games: list[InstalledGame] = []
+        self._all_games: list[LibraryGame] = []
+        self._owned: list[tuple[int, str]] = self._load_owned_from_cache()
+        self._owned_thread: Optional[_FetchOwnedGamesThread] = None
         self._cards_remaining_snapshot: dict[int, int] = {}
         self._badge_thread: Optional[_FetchBadgeProgressThread] = None
+        self._installed: list = []
+        self._owned_manual = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
@@ -374,8 +411,10 @@ class LibraryView(QWidget):
         self.search = SearchLineEdit(self)
         self.search.setPlaceholderText("Szukaj gry…")
         self.refresh_btn = TransparentToolButton(FluentIcon.SYNC, self)
-        self.refresh_btn.setToolTip("Odśwież listę zainstalowanych gier (z dysku)")
-        self.refresh_btn.clicked.connect(self.reload_games)
+        self.refresh_btn.setToolTip(
+            "Odśwież listę gier (zainstalowane z dysku, pozostałe z konta Steam)"
+        )
+        self.refresh_btn.clicked.connect(lambda: self.reload_games(manual=True))
         top_row.addWidget(self.search, stretch=1)
         top_row.addWidget(self.refresh_btn)
         root.addLayout(top_row)
@@ -434,13 +473,28 @@ class LibraryView(QWidget):
         # (KDE Plasma) - widget łapał się w trakcie relayoutu.
         QTimer.singleShot(0, self.reload_games)
 
-    def reload_games(self) -> None:
-        self._all_games = scan_installed_games()
+    @staticmethod
+    def _load_owned_from_cache() -> list[tuple[int, str]]:
+        """Lista gier z konta zapisana przy ostatnim udanym pobraniu.
+        Pomijana tylko gdy wiemy, że należy do INNEGO konta niż obecna sesja."""
+        cached_id, games = load_owned_games_cache()
+        current_id = extract_steam_id64_from_cookie(load_community_session().session_cookie)
+        if current_id is not None and cached_id and cached_id != current_id:
+            return []
+        return games
+
+    def reload_games(self, manual: bool = False) -> None:
+        """Skan dysku jest natychmiastowy, więc lista zainstalowanych gier
+        (scalona z ostatnio pobraną listą z konta) pojawia się od razu.
+        Odświeżenie listy z konta idzie w tle: automatycznie po weryfikacji
+        sesji (MainWindow) i ręcznie tym przyciskiem."""
+        self._installed = scan_installed_games()
+        self._all_games = merge_library(self._installed, self._owned)
 
         if not self._all_games:
             InfoBar.warning(
                 title="Brak gier",
-                content="Nie znaleziono zainstalowanych gier Steam na tym koncie/dysku.",
+                content="Nie znaleziono gier Steam na tym koncie/dysku.",
                 parent=self,
                 position=InfoBarPosition.TOP,
                 duration=4000,
@@ -457,6 +511,68 @@ class LibraryView(QWidget):
         if self.model.has_card_data():
             self.model.set_cards_remaining(self._cards_remaining_snapshot)
         self._apply_filter()
+
+        if manual:
+            self.refresh_owned_games(manual=True)
+
+    def refresh_owned_games(self, manual: bool = False) -> None:
+        """Pobiera w tle pełną listę gier z konta. `manual` = user sam o to
+        poprosił, więc dostaje komunikaty o wyniku; automatyczne wywołanie
+        (po weryfikacji sesji) milczy przy błędach sieci."""
+        session = load_community_session()
+        if not session.is_configured():
+            if manual:
+                InfoBar.info(
+                    title="Tylko gry zainstalowane",
+                    content="Żeby zobaczyć też niezainstalowane gry z konta, "
+                    "skonfiguruj sesję Steam w zakładce Konto.",
+                    parent=self,
+                    position=InfoBarPosition.TOP,
+                    duration=5000,
+                )
+            return
+        if self._owned_thread is not None and self._owned_thread.isRunning():
+            return
+
+        self.refresh_btn.setEnabled(False)
+        self._owned_manual = manual
+        self._owned_thread = _FetchOwnedGamesThread(
+            session.session_cookie, session.session_id, self
+        )
+        self._owned_thread.finished_ok.connect(self._on_owned_ok)
+        self._owned_thread.session_expired.connect(self._on_owned_session_expired)
+        self._owned_thread.finished_error.connect(self._on_owned_error)
+        self._owned_thread.start()
+
+    def _on_owned_ok(self, steam_id64: str, games: list) -> None:
+        self.refresh_btn.setEnabled(True)
+        self._owned = [(g.app_id, g.name) for g in games]
+        save_owned_games_cache(steam_id64, self._owned)
+        self._all_games = merge_library(self._installed, self._owned)
+        self._apply_filter()
+        if self._owned_manual:
+            InfoBar.success(
+                title="Lista gier odświeżona",
+                content=f"Gier na koncie: {len(games)}.",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+            )
+
+    def _on_owned_session_expired(self, message: str) -> None:
+        self.refresh_btn.setEnabled(True)
+        self.sessionExpiredDetected.emit(message)
+
+    def _on_owned_error(self, message: str) -> None:
+        self.refresh_btn.setEnabled(True)
+        if self._owned_manual:
+            InfoBar.error(
+                title="Nie udało się pobrać listy gier z konta",
+                content=message,
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
 
     def _apply_filter(self, *_args) -> None:
         text = self.search.text().lower().strip()

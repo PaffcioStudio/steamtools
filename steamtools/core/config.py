@@ -223,3 +223,64 @@ def clear_community_session() -> None:
         _community_session_path().unlink(missing_ok=True)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------- #
+# Cache listy WSZYSTKICH gier z konta (także niezainstalowanych) -
+# core/owned.py. Lista pochodzi ze Steam Community i wymaga ważnej sesji,
+# więc po udanym pobraniu trzymamy ją na dysku: Biblioteka od razu pokazuje
+# pełną listę przy starcie, także gdy sesja akurat wygasła albo nie ma
+# internetu. Zapisujemy SteamID64, żeby po zmianie konta nie pokazać gier
+# poprzedniego właściciela.
+# ---------------------------------------------------------------------- #
+
+
+def _owned_games_cache_path() -> Path:
+    return _config_dir() / "owned_games.json"
+
+
+def save_owned_games_cache(steam_id64: str, games: list[tuple[int, str]]) -> None:
+    """Best-effort, jak save_idle_queue - błąd zapisu nie wywala aplikacji."""
+    try:
+        _config_dir().mkdir(parents=True, exist_ok=True)
+        _owned_games_cache_path().write_text(
+            json.dumps(
+                {
+                    "steam_id64": steam_id64,
+                    "games": [{"app_id": a, "name": n} for a, n in games],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def load_owned_games_cache() -> tuple[str, list[tuple[int, str]]]:
+    """Zwraca (steam_id64, [(app_id, nazwa), ...]); pusty wynik, gdy cache
+    nie istnieje albo jest uszkodzony."""
+    path = _owned_games_cache_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "", []
+    if not isinstance(data, dict):
+        return "", []
+    games: list[tuple[int, str]] = []
+    for raw in data.get("games", []):
+        if isinstance(raw, dict) and isinstance(raw.get("app_id"), int) and isinstance(raw.get("name"), str):
+            games.append((raw["app_id"], raw["name"]))
+    return str(data.get("steam_id64", "")), games
+
+
+def save_debug_dump(name: str, text: str) -> str:
+    """Zapisuje surową odpowiedź Steam (do diagnozy zmienionego układu
+    strony) w katalogu konfiguracji. Zwraca ścieżkę albo "" przy błędzie."""
+    try:
+        _config_dir().mkdir(parents=True, exist_ok=True)
+        path = _config_dir() / name
+        path.write_text(text[:400_000], encoding="utf-8")
+        return str(path)
+    except OSError:
+        return ""

@@ -160,10 +160,6 @@ def extract_steam_id64_from_cookie(session_cookie: str) -> Optional[str]:
     return None
 
 
-def _build_badges_url(steam_id64: str) -> str:
-    return f"https://steamcommunity.com/profiles/{steam_id64}/badges/?p=1"
-
-
 _LOGGED_IN_ID_RE = re.compile(r"""g_steamID\s*=\s*["']?(\d{17})["']?""")
 _LOGGED_OUT_RE = re.compile(r"""g_steamID\s*=\s*(?:false|null|["']{2})""")
 
@@ -213,12 +209,15 @@ def _extract_persona_name(html: str) -> Optional[str]:
     return None
 
 
-def _load_badges_page(session_cookie: str, session_id: str = "") -> tuple[str, SessionInfo]:
-    """Pobiera stronę Badges konta i WERYFIKUJE, że Steam uznaje nas za
-    zalogowanych. Jedyne miejsce w programie, które robi to zapytanie -
-    zarówno scraping kart, jak i sprawdzanie sesji w zakładce Konto /
-    przy starcie idą tą samą drogą, więc nie da się już "sprawdzić kart"
-    na martwym ciasteczku i dostać pustego, mylącego wyniku.
+def load_community_page(
+    url: str, session_cookie: str, session_id: str = "", strict: bool = True
+) -> tuple[str, SessionInfo]:
+    """Pobiera dowolną stronę Steam Community na ciasteczku sesji i
+    WERYFIKUJE, że Steam uznaje nas za zalogowanych. Jedyne miejsce w
+    programie, które robi takie zapytanie - scraping kart, lista gier z
+    konta i sprawdzanie sesji w zakładce Konto / przy starcie idą tą samą
+    drogą, więc nie da się już "sprawdzić" czegokolwiek na martwym
+    ciasteczku i dostać pustego, mylącego wyniku.
 
     Rzuca:
       SteamSessionExpiredError - Steam potwierdził brak zalogowania
@@ -234,13 +233,12 @@ def _load_badges_page(session_cookie: str, session_id: str = "") -> tuple[str, S
             "<SteamID64>||<token>, np. 76561198012345678||A1B2C3...)."
         )
 
-    url = _build_badges_url(steam_id64)
     cookie_header = f"steamLoginSecure={session_cookie}"
     if session_id:
         cookie_header += f"; sessionid={session_id}"
 
     request = urllib.request.Request(
-        url,
+        url.format(steam_id64=steam_id64),
         headers={
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) SteamTools/0.1.0",
             "Cookie": cookie_header,
@@ -248,7 +246,7 @@ def _load_badges_page(session_cookie: str, session_id: str = "") -> tuple[str, S
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=15) as response:
             html = response.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -271,7 +269,14 @@ def _load_badges_page(session_cookie: str, session_id: str = "") -> tuple[str, S
     except (TimeoutError, OSError) as exc:
         raise SteamCommunityError(f"Brak połączenia ze Steam Community: {exc}") from exc
 
-    logged_in = _detect_login_state(html)
+    # strict=False dla stron o innym układzie nagłówka niż Badges (nowsze
+    # strony Steam nie zawsze mają g_steamID/account_pulldown): sesję uznajemy
+    # za martwą tylko po wyraźnym sygnale wylogowania, a brak sygnałów nie
+    # jest błędem - o poprawności odpowiedzi decyduje wtedy sam parser strony.
+    if strict:
+        logged_in = _detect_login_state(html)
+    else:
+        logged_in = False if _LOGGED_OUT_RE.search(html) else True
     if logged_in is False:
         raise SteamSessionExpiredError(
             "Steam nie rozpoznaje tego ciasteczka jako zalogowanej sesji "
@@ -285,6 +290,14 @@ def _load_badges_page(session_cookie: str, session_id: str = "") -> tuple[str, S
         )
 
     return html, SessionInfo(steam_id64=steam_id64, persona_name=_extract_persona_name(html))
+
+
+def _load_badges_page(session_cookie: str, session_id: str = "") -> tuple[str, SessionInfo]:
+    return load_community_page(
+        "https://steamcommunity.com/profiles/{steam_id64}/badges/?p=1",
+        session_cookie,
+        session_id,
+    )
 
 
 def verify_session(session_cookie: str, session_id: str = "") -> SessionInfo:

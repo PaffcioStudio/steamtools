@@ -28,7 +28,8 @@ from qfluentwidgets import (
     SearchLineEdit,
 )
 
-from steamtools.core.steamworks import SteamClient, SteamworksError, AchievementInfo
+from steamtools.core.steamworks import SteamworksError, AchievementInfo
+from steamtools.core.ach_worker import load_achievements, store_achievements
 
 # Powyżej tej liczby jednoczesnych zmian pytamy o potwierdzenie - żeby
 # "Zaznacz wszystkie" na grze ze 100 osiągnięciami nie odblokowało wszystkiego
@@ -46,11 +47,30 @@ class _LoadAchievementsThread(QThread):
 
     def run(self) -> None:
         try:
-            with SteamClient(app_id=self.app_id) as client:
-                achievements = client.get_achievements()
-            self.loaded.emit(achievements)
+            self.loaded.emit(load_achievements(self.app_id))
         except SteamworksError as exc:
             self.failed.emit(str(exc))
+
+
+class _StoreAchievementsThread(QThread):
+    stored = pyqtSignal(int)  # liczba zapisanych zmian
+    failed = pyqtSignal(str)
+
+    def __init__(self, app_id: int, changes: dict, parent=None):
+        super().__init__(parent)
+        self.app_id = app_id
+        self.changes = changes
+
+    def run(self) -> None:
+        try:
+            ok = store_achievements(self.app_id, self.changes)
+        except SteamworksError as exc:
+            self.failed.emit(str(exc))
+            return
+        if ok:
+            self.stored.emit(len(self.changes))
+        else:
+            self.failed.emit("Steam odrzucił zapis statystyk (StoreStats).")
 
 
 class AchievementRow(CardWidget):
@@ -199,6 +219,7 @@ class AchievementsView(QWidget):
         self.stack.setCurrentWidget(self.empty_state)
 
         self._thread: _LoadAchievementsThread | None = None
+        self._store_thread: _StoreAchievementsThread | None = None
 
     def load_game(self, app_id: int, name: str) -> None:
         self.app_id = app_id
@@ -323,25 +344,36 @@ class AchievementsView(QWidget):
     def _store_changes(self) -> None:
         if self.app_id is None or not self._pending_changes:
             return
-        try:
-            with SteamClient(app_id=self.app_id) as client:
-                for api_name, unlocked in self._pending_changes.items():
-                    client.set_achievement(api_name, unlocked)
-                client.store_stats()
-            InfoBar.success(
-                title="Zapisano",
-                content=f"Zaktualizowano {len(self._pending_changes)} osiągnięć.",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=3000,
-            )
-            self._pending_changes.clear()
-            self.store_btn.setEnabled(False)
-        except SteamworksError as exc:
-            InfoBar.error(
-                title="Błąd zapisu",
-                content=str(exc),
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=6000,
-            )
+        if self._store_thread is not None and self._store_thread.isRunning():
+            return
+        self.store_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        self._store_thread = _StoreAchievementsThread(
+            self.app_id, dict(self._pending_changes), self
+        )
+        self._store_thread.stored.connect(self._on_stored)
+        self._store_thread.failed.connect(self._on_store_failed)
+        self._store_thread.start()
+
+    def _on_stored(self, count: int) -> None:
+        self.progress.setVisible(False)
+        InfoBar.success(
+            title="Zapisano",
+            content=f"Zaktualizowano {count} osiągnięć.",
+            parent=self,
+            position=InfoBarPosition.TOP,
+            duration=3000,
+        )
+        self._pending_changes.clear()
+        self.store_btn.setEnabled(False)
+
+    def _on_store_failed(self, message: str) -> None:
+        self.progress.setVisible(False)
+        self.store_btn.setEnabled(bool(self._pending_changes))
+        InfoBar.error(
+            title="Błąd zapisu",
+            content=message,
+            parent=self,
+            position=InfoBarPosition.TOP,
+            duration=6000,
+        )
