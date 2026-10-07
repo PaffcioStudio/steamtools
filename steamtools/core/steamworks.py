@@ -79,6 +79,11 @@ class AchievementInfo:
     hidden: bool
     icon_normal: str = ""
     icon_locked: str = ""
+    # Ikona w aktualnym stanie osiągnięcia (odblokowana albo szara), surowe
+    # RGBA 8 bit/kanał - pusta, gdy gra nie ma ikony albo Steam jej nie dostarczył.
+    icon_w: int = 0
+    icon_h: int = 0
+    icon_rgba: bytes = b""
 
 
 @dataclass
@@ -256,6 +261,21 @@ class SteamClient:
         ]
         lib.SteamAPI_ISteamUserStats_GetAchievementDisplayAttribute.restype = ctypes.c_char_p
 
+        lib.SteamAPI_ISteamUserStats_GetAchievementIcon.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p,
+        ]
+        lib.SteamAPI_ISteamUserStats_GetAchievementIcon.restype = ctypes.c_int32
+
+        lib.SteamAPI_ISteamUtils_GetImageSize.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.SteamAPI_ISteamUtils_GetImageSize.restype = ctypes.c_bool
+        lib.SteamAPI_ISteamUtils_GetImageRGBA.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32,
+        ]
+        lib.SteamAPI_ISteamUtils_GetImageRGBA.restype = ctypes.c_bool
+
         lib.SteamAPI_ISteamUserStats_SetAchievement.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p,
         ]
@@ -321,7 +341,9 @@ class SteamClient:
             count = lib.SteamAPI_ISteamUserStats_GetNumAchievements(self._user_stats)
             attempts += 1
 
+        utils = self._get_utils()
         results: list[AchievementInfo] = []
+        icon_handles: dict[str, int] = {}
         for i in range(count):
             raw_name = lib.SteamAPI_ISteamUserStats_GetAchievementName(
                 self._user_stats, i
@@ -342,6 +364,10 @@ class SteamClient:
             display_name = self._get_attr(name, "name") or name
             description = self._get_attr(name, "desc") or ""
             hidden = self._get_attr(name, "hidden") == "1"
+            if utils:
+                icon_handles[name] = lib.SteamAPI_ISteamUserStats_GetAchievementIcon(
+                    self._user_stats, name.encode("utf-8")
+                )
 
             results.append(
                 AchievementInfo(
@@ -353,7 +379,65 @@ class SteamClient:
                     hidden=hidden,
                 )
             )
+        if utils:
+            self._attach_icons(utils, results, icon_handles)
         return results
+
+    def _get_utils(self):
+        """Wskaźnik ISteamUtils (potrzebny do odczytu pikseli ikon).
+        Wersja interfejsu w nazwie akcesora zależy od SDK, więc próbujemy
+        po kolei kilku znanych - brak któregokolwiek znaczy tylko "bez
+        ikon", nigdy błąd całego ładowania osiągnięć."""
+        for version in range(12, 6, -1):
+            accessor = getattr(self._lib, f"SteamAPI_SteamUtils_v{version:03d}", None)
+            if accessor is None:
+                continue
+            accessor.restype = ctypes.c_void_p
+            ptr = accessor()
+            if ptr:
+                return ptr
+        return None
+
+    def _attach_icons(self, utils, results: list[AchievementInfo], handles: dict[str, int]) -> None:
+        lib = self._lib
+        # Steam dociąga ikony asynchronicznie: -1 = jeszcze się pobiera, a tuż
+        # po starcie sesji potrafi też zwrócić 0 (brak), zanim klient zdąży
+        # zacząć pobieranie. Pompujemy callbacki i pytamy ponownie: pierwsze
+        # 1.5 s o wszystkie nierozwiązane (<= 0), potem (do 8 s łącznie)
+        # tylko o te, które na pewno są w drodze (-1). Gra naprawdę bez ikon
+        # kosztuje więc najwyżej 1.5 s.
+        started = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - started
+            retry_all = elapsed < 1.5
+            pending = [
+                n for n, h in handles.items()
+                if h == -1 or (retry_all and h == 0)
+            ]
+            if not pending or elapsed > 8.0:
+                break
+            lib.SteamAPI_RunCallbacks()
+            time.sleep(0.1)
+            for name in pending:
+                handles[name] = lib.SteamAPI_ISteamUserStats_GetAchievementIcon(
+                    self._user_stats, name.encode("utf-8")
+                )
+
+        for ach in results:
+            handle = handles.get(ach.api_name, 0)
+            if handle <= 0:
+                continue
+            w, h = ctypes.c_uint32(0), ctypes.c_uint32(0)
+            if not lib.SteamAPI_ISteamUtils_GetImageSize(
+                utils, handle, ctypes.pointer(w), ctypes.pointer(h)
+            ):
+                continue
+            size = w.value * h.value * 4
+            if size <= 0 or size > 4 * 1024 * 1024:
+                continue
+            buf = ctypes.create_string_buffer(size)
+            if lib.SteamAPI_ISteamUtils_GetImageRGBA(utils, handle, buf, size):
+                ach.icon_w, ach.icon_h, ach.icon_rgba = w.value, h.value, buf.raw[:size]
 
     def _get_attr(self, api_name: str, key: str) -> str:
         raw = self._lib.SteamAPI_ISteamUserStats_GetAchievementDisplayAttribute(

@@ -6,7 +6,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget, QLabel
 
 from qfluentwidgets import (
     TitleLabel,
@@ -73,16 +74,35 @@ class _StoreAchievementsThread(QThread):
             self.failed.emit("Steam odrzucił zapis statystyk (StoreStats).")
 
 
+_ICON_SIZE = 48
+
+
+def icon_pixmap(ach: AchievementInfo) -> QPixmap | None:
+    """Ikona osiągnięcia z surowego RGBA (Steamworks) jako QPixmap, albo
+    None, gdy gra nie dostarczyła ikony."""
+    if not ach.icon_rgba or ach.icon_w <= 0 or ach.icon_h <= 0:
+        return None
+    if len(ach.icon_rgba) < ach.icon_w * ach.icon_h * 4:
+        return None
+    # copy() odłącza QImage od bufora bytes, który może zniknąć po zwrocie.
+    image = QImage(
+        ach.icon_rgba, ach.icon_w, ach.icon_h, ach.icon_w * 4,
+        QImage.Format.Format_RGBA8888,
+    ).copy()
+    return QPixmap.fromImage(image)
+
+
 class AchievementRow(CardWidget):
     toggled = pyqtSignal(str, bool)  # api_name, new_state
 
     def __init__(self, ach: AchievementInfo, parent=None):
         super().__init__(parent)
         self.ach = ach
-        self.setFixedHeight(64)
+        self.setFixedHeight(72)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(16, 8, 16, 8)
+        layout.setSpacing(12)
 
         self.checkbox = CheckBox(self)
         self.checkbox.setChecked(ach.is_achieved)
@@ -90,6 +110,20 @@ class AchievementRow(CardWidget):
             lambda state: self.toggled.emit(ach.api_name, state == Qt.CheckState.Checked.value)
         )
         layout.addWidget(self.checkbox)
+
+        self.icon_label = QLabel(self)
+        self.icon_label.setFixedSize(_ICON_SIZE, _ICON_SIZE)
+        pixmap = icon_pixmap(ach)
+        if pixmap is not None:
+            dpr = self.devicePixelRatioF() or 1.0
+            scaled = pixmap.scaled(
+                int(_ICON_SIZE * dpr), int(_ICON_SIZE * dpr),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            scaled.setDevicePixelRatio(dpr)
+            self.icon_label.setPixmap(scaled)
+        layout.addWidget(self.icon_label)
 
         text_col = QVBoxLayout()
         title_text = ach.display_name if not ach.hidden or ach.is_achieved else "??? (ukryte)"
