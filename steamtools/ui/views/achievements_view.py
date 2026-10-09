@@ -27,9 +27,11 @@ from qfluentwidgets import (
     ScrollArea,
     MessageBox,
     SearchLineEdit,
+    ComboBox,
 )
 
 from steamtools.core.steamworks import SteamworksError, AchievementInfo
+from steamtools.core.errors import friendly_error
 from steamtools.core.ach_worker import load_achievements, store_achievements
 
 # Powyżej tej liczby jednoczesnych zmian pytamy o potwierdzenie - żeby
@@ -40,7 +42,7 @@ _CONFIRM_THRESHOLD = 10
 
 class _LoadAchievementsThread(QThread):
     loaded = pyqtSignal(list)
-    failed = pyqtSignal(str)
+    failed = pyqtSignal(str, str)  # tytuł, treść (przyjazne, patrz core/errors.py)
 
     def __init__(self, app_id: int, parent=None):
         super().__init__(parent)
@@ -50,12 +52,12 @@ class _LoadAchievementsThread(QThread):
         try:
             self.loaded.emit(load_achievements(self.app_id))
         except SteamworksError as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(*friendly_error(exc))
 
 
 class _StoreAchievementsThread(QThread):
     stored = pyqtSignal(int)  # liczba zapisanych zmian
-    failed = pyqtSignal(str)
+    failed = pyqtSignal(str, str)
 
     def __init__(self, app_id: int, changes: dict, parent=None):
         super().__init__(parent)
@@ -66,15 +68,21 @@ class _StoreAchievementsThread(QThread):
         try:
             ok = store_achievements(self.app_id, self.changes)
         except SteamworksError as exc:
-            self.failed.emit(str(exc))
+            title, content = friendly_error(exc)
+            self.failed.emit("Błąd zapisu" if exc.kind == "generic" else title, content)
             return
         if ok:
             self.stored.emit(len(self.changes))
         else:
-            self.failed.emit("Steam odrzucił zapis statystyk (StoreStats).")
+            self.failed.emit("Błąd zapisu", "Steam odrzucił zapis statystyk (StoreStats).")
 
 
 _ICON_SIZE = 48
+
+# Kolejność odpowiada indeksom w ComboBoxach - _matches_filter/_sort_key
+# rozróżniają tryby po numerze, więc nową pozycję dopisuj na końcu.
+_FILTER_MODES = ["Wszystkie", "Odblokowane", "Zablokowane", "Ukryte", "Zmienione (do zapisu)"]
+_SORT_MODES = ["Kolejność gry", "Nazwa A-Z", "Najnowsze odblokowane", "Zablokowane najpierw"]
 
 
 def icon_pixmap(ach: AchievementInfo) -> QPixmap | None:
@@ -98,6 +106,8 @@ class AchievementRow(CardWidget):
     def __init__(self, ach: AchievementInfo, parent=None):
         super().__init__(parent)
         self.ach = ach
+        self.matched = True  # czy przechodzi aktualny filtr/wyszukiwanie
+        self.order = 0
         self.setFixedHeight(72)
 
         layout = QHBoxLayout(self)
@@ -223,9 +233,30 @@ class AchievementsView(QWidget):
         header_row.addWidget(self.store_btn)
         root.addLayout(header_row)
 
+        search_row = QHBoxLayout()
         self.search = SearchLineEdit(content)
         self.search.setPlaceholderText("Szukaj po nazwie lub opisie…")
-        root.addWidget(self.search)
+        search_row.addWidget(self.search, stretch=1)
+
+        self.filter_combo = ComboBox(content)
+        self.filter_combo.addItems(_FILTER_MODES)
+        self.filter_combo.setToolTip("Pokaż tylko wybrane osiągnięcia")
+        self.sort_combo = ComboBox(content)
+        self.sort_combo.addItems(_SORT_MODES)
+        self.sort_combo.setToolTip("Kolejność osiągnięć")
+        self.undo_btn = PushButton("Cofnij zmiany", content, FluentIcon.CANCEL)
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.clicked.connect(self._undo_changes)
+        self.filter_combo.currentIndexChanged.connect(self._apply_filter)
+        self.sort_combo.currentIndexChanged.connect(self._apply_sort)
+        search_row.addWidget(self.filter_combo)
+        search_row.addWidget(self.sort_combo)
+        search_row.addWidget(self.undo_btn)
+        root.addLayout(search_row)
+
+        self.summary_label = CaptionLabel("", content)
+        self.summary_label.setTextColor("#606060", "#c0c0c0")
+        root.addWidget(self.summary_label)
 
         # Debounce - filtrowanie listy przy każdym naciśniętym znaku byłoby
         # zbędnym obciążeniem, zwłaszcza na grach z setkami osiągnięć.
@@ -265,6 +296,12 @@ class AchievementsView(QWidget):
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
+        for combo in (self.filter_combo, self.sort_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.undo_btn.setEnabled(False)
+        self.summary_label.setText("")
 
         for row in self._rows:
             row.setParent(None)
@@ -278,11 +315,13 @@ class AchievementsView(QWidget):
 
     def _on_loaded(self, achievements: list[AchievementInfo]) -> None:
         self.progress.setVisible(False)
-        for ach in achievements:
+        for index, ach in enumerate(achievements):
             row = AchievementRow(ach, self.list_widget)
+            row.order = index  # kolejność zwrócona przez grę (sortowanie "domyślne")
             row.toggled.connect(self._on_toggle)
             self.list_layout.insertWidget(self.list_layout.count() - 1, row)
             self._rows.append(row)
+        self._update_summary()
 
         has_achievements = bool(achievements)
         self.select_all_btn.setEnabled(has_achievements)
@@ -297,37 +336,110 @@ class AchievementsView(QWidget):
                 duration=3500,
             )
 
-    def _apply_filter(self) -> None:
+    def _matches_filter(self, row: AchievementRow) -> bool:
+        mode = self.filter_combo.currentIndex()
+        checked = row.checkbox.isChecked()
+        if mode == 1:
+            return checked
+        if mode == 2:
+            return not checked
+        if mode == 3:
+            return row.ach.hidden
+        if mode == 4:
+            return row.ach.api_name in self._pending_changes
+        return True
+
+    def _matches_text(self, row: AchievementRow, text: str) -> bool:
+        if not text:
+            return True
+        # Filtrujemy po tym co FAKTYCZNIE widać na ekranie (nazwa może
+        # być zamaskowana jako "??? (ukryte)" dla nieodblokowanych,
+        # ukrytych osiągnięć) - nie po surowych danych z AchievementInfo.
+        # Filtrowanie po surowej, ukrytej treści pozwalałoby odkryć
+        # istnienie/opis ukrytego osiągnięcia (potencjalny spoiler)
+        # samym wpisywaniem słów w wyszukiwarkę, czego chcemy uniknąć.
+        ach = row.ach
+        visible_name = ach.display_name if not ach.hidden or ach.is_achieved else "??? (ukryte)"
+        visible_desc = ach.description if not ach.hidden or ach.is_achieved else ""
+        return text in f"{visible_name} {visible_desc}".lower()
+
+    def _apply_filter(self, *_args) -> None:
         text = self.search.text().lower().strip()
         for row in self._rows:
-            if not text:
-                row.setVisible(True)
-                continue
-            # Filtrujemy po tym co FAKTYCZNIE widać na ekranie (nazwa może
-            # być zamaskowana jako "??? (ukryte)" dla nieodblokowanych,
-            # ukrytych osiągnięć) - nie po surowych danych z AchievementInfo.
-            # Filtrowanie po surowej, ukrytej treści pozwalałoby odkryć
-            # istnienie/opis ukrytego osiągnięcia (potencjalny spoiler)
-            # samym wpisywaniem słów w wyszukiwarkę, czego chcemy uniknąć.
-            ach = row.ach
-            visible_name = ach.display_name if not ach.hidden or ach.is_achieved else "??? (ukryte)"
-            visible_desc = ach.description if not ach.hidden or ach.is_achieved else ""
-            haystack = f"{visible_name} {visible_desc}".lower()
-            row.setVisible(text in haystack)
+            # Własna flaga zamiast isHidden(): tuż po dodaniu do layoutu Qt
+            # zgłasza dziecko jako ukryte, zanim rodzic je faktycznie pokaże.
+            row.matched = self._matches_text(row, text) and self._matches_filter(row)
+            row.setVisible(row.matched)
+        self._update_summary()
 
-    def _on_failed(self, message: str) -> None:
+    def _sort_key(self, row: AchievementRow):
+        mode = self.sort_combo.currentIndex()
+        if mode == 1:
+            return row.ach.display_name.lower()
+        if mode == 2:
+            # odblokowane od najnowszego, zablokowane na końcu (w kolejności gry)
+            return (0, -row.ach.unlock_time, row.order) if row.ach.is_achieved else (1, 0, row.order)
+        if mode == 3:
+            return (0, row.order) if not row.checkbox.isChecked() else (1, row.order)
+        return row.order
+
+    def _apply_sort(self, *_args) -> None:
+        ordered = sorted(self._rows, key=self._sort_key)
+        for row in ordered:
+            self.list_layout.removeWidget(row)
+        for position, row in enumerate(ordered):
+            self.list_layout.insertWidget(position, row)
+
+    def _update_summary(self) -> None:
+        total = len(self._rows)
+        if not total:
+            self.summary_label.setText("")
+            return
+        unlocked = sum(1 for r in self._rows if r.checkbox.isChecked())
+        shown = sum(1 for r in self._rows if r.matched)
+        text = f"Odblokowano {unlocked} z {total}"
+        if shown != total:
+            text += f"  •  widocznych: {shown}"
+        if self._pending_changes:
+            text += f"  •  niezapisanych zmian: {len(self._pending_changes)}"
+        self.summary_label.setText(text)
+
+    def _after_state_change(self) -> None:
+        """Stan checkboxów/zmian oczekujących się zmienił - odśwież to, co
+        od niego zależy (filtr stanu, sortowanie po stanie, licznik)."""
+        self.undo_btn.setEnabled(bool(self._pending_changes))
+        if self.filter_combo.currentIndex() in (1, 2, 4):
+            self._apply_filter()
+        else:
+            self._update_summary()
+
+    def _undo_changes(self) -> None:
+        """Przywraca stan sprzed edycji (to, co faktycznie jest na koncie)."""
+        for row in self._rows:
+            row.set_checked_silently(row.ach.is_achieved)
+        self._pending_changes.clear()
+        self.store_btn.setEnabled(False)
+        self._after_state_change()
+
+    def _on_failed(self, title: str, content: str) -> None:
         self.progress.setVisible(False)
         InfoBar.error(
-            title="Błąd Steamworks",
-            content=message,
+            title=title,
+            content=content,
             parent=self,
             position=InfoBarPosition.TOP,
             duration=6000,
         )
 
     def _on_toggle(self, api_name: str, new_state: bool) -> None:
-        self._pending_changes[api_name] = new_state
+        # Wrócenie checkboxa do stanu z konta nie jest już "zmianą".
+        row = next((r for r in self._rows if r.ach.api_name == api_name), None)
+        if row is not None and row.ach.is_achieved == new_state:
+            self._pending_changes.pop(api_name, None)
+        else:
+            self._pending_changes[api_name] = new_state
         self.store_btn.setEnabled(bool(self._pending_changes))
+        self._after_state_change()
 
     def _set_all(self, checked: bool) -> None:
         """Zaznacza lub odznacza wszystkie osiągnięcia naraz. Przy wielu
@@ -343,8 +455,11 @@ class AchievementsView(QWidget):
         # (row.checkbox.isChecked()), nie z oryginalnym ach.is_achieved z
         # serwera - user mógł już poklikać część osiągnięć ręcznie przed
         # kliknięciem "Zaznacz wszystkie", i to musi być uwzględnione.
+        # Działa na widocznych wierszach: po zawężeniu filtrem/wyszukiwarką
+        # "Zaznacz wszystkie" dotyczy tego, co user widzi na liście.
         rows_to_change = [
-            row for row in self._rows if row.checkbox.isChecked() != checked
+            row for row in self._rows
+            if row.matched and row.checkbox.isChecked() != checked
         ]
         if not rows_to_change:
             InfoBar.info(
@@ -371,9 +486,13 @@ class AchievementsView(QWidget):
 
         for row in rows_to_change:
             row.set_checked_silently(checked)
-            self._pending_changes[row.ach.api_name] = checked
+            if row.ach.is_achieved == checked:
+                self._pending_changes.pop(row.ach.api_name, None)
+            else:
+                self._pending_changes[row.ach.api_name] = checked
 
         self.store_btn.setEnabled(bool(self._pending_changes))
+        self._after_state_change()
 
     def _store_changes(self) -> None:
         if self.app_id is None or not self._pending_changes:
@@ -398,15 +517,22 @@ class AchievementsView(QWidget):
             position=InfoBarPosition.TOP,
             duration=3000,
         )
+        # Zapisany stan jest teraz stanem "z konta" - "Cofnij zmiany" i
+        # maskowanie ukrytych osiągnięć mają się odnosić do niego.
+        saved = self._store_thread.changes if self._store_thread is not None else {}
+        for row in self._rows:
+            if row.ach.api_name in saved:
+                row.ach.is_achieved = saved[row.ach.api_name]
         self._pending_changes.clear()
         self.store_btn.setEnabled(False)
+        self._after_state_change()
 
-    def _on_store_failed(self, message: str) -> None:
+    def _on_store_failed(self, title: str, content: str) -> None:
         self.progress.setVisible(False)
         self.store_btn.setEnabled(bool(self._pending_changes))
         InfoBar.error(
-            title="Błąd zapisu",
-            content=message,
+            title=title,
+            content=content,
             parent=self,
             position=InfoBarPosition.TOP,
             duration=6000,

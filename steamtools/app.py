@@ -11,6 +11,8 @@ from PyQt6.QtWidgets import QApplication
 
 from qfluentwidgets import setTheme, Theme
 
+from steamtools.core.config import get_app_version
+from steamtools.core.logging_setup import setup_logging
 from steamtools.ui.main_window import MainWindow
 
 
@@ -27,6 +29,7 @@ def _qt_message_filter(msg_type: QtMsgType, context, message: str) -> None:
 
 
 def main() -> int:
+    setup_logging(get_app_version())
     qInstallMessageHandler(_qt_message_filter)
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(

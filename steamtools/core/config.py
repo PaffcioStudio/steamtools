@@ -284,3 +284,8 @@ def save_debug_dump(name: str, text: str) -> str:
         return str(path)
     except OSError:
         return ""
+
+
+def covers_cache_dir() -> Path:
+    """Katalog na pobrane z CDN okładki gier (core/covers.py)."""
+    return _config_dir() / "covers"

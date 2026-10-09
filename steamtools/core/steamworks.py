@@ -31,7 +31,27 @@ from typing import Optional
 
 
 class SteamworksError(RuntimeError):
-    """Błąd inicjalizacji lub komunikacji ze Steamworks API."""
+    """Błąd inicjalizacji lub komunikacji ze Steamworks API. `kind` mówi, co
+    poszło nie tak (patrz core/errors.py: komunikaty dla użytkownika)."""
+
+    kind = "generic"
+
+    def __init__(self, message: str = "", kind: str | None = None):
+        super().__init__(message)
+        if kind is not None:
+            self.kind = kind
+
+
+class SteamNotRunningError(SteamworksError):
+    kind = "not_running"
+
+
+class GameNotOwnedError(SteamworksError):
+    kind = "not_owned"
+
+
+class SteamLibraryMissingError(SteamworksError):
+    kind = "lib_missing"
 
 
 # Wartości enum ESteamAPIInitResult (steam_api.h) - potrzebne do
@@ -151,7 +171,7 @@ class SteamClient:
             return
 
         if not self._lib_path.exists():
-            raise SteamworksError(
+            raise SteamLibraryMissingError(
                 f"Brak {self._lib_path}. Umieść libsteam_api.so z oficjalnego "
                 f"Steamworks SDK w steamtools/vendor/linux64/."
             )
@@ -165,7 +185,7 @@ class SteamClient:
         self._bind_signatures()
 
         if not self._lib.SteamAPI_IsSteamRunning():
-            raise SteamworksError(
+            raise SteamNotRunningError(
                 "Klient Steam nie jest uruchomiony. Uruchom Steam, zaloguj się "
                 "i spróbuj ponownie."
             )
@@ -177,7 +197,12 @@ class SteamClient:
             detail = err_msg.value.decode("utf-8", errors="ignore").strip()
             reason = _INIT_RESULT_MESSAGES.get(result, f"Kod błędu {result}.")
             message = reason if not detail else f"{reason} ({detail})"
-            raise SteamworksError(f"SteamAPI_InitFlat nie powiodło się: {message}")
+            error_cls = (
+                SteamNotRunningError
+                if result == K_ESTEAM_API_INIT_RESULT_NO_STEAM_CLIENT
+                else SteamworksError
+            )
+            raise error_cls(f"SteamAPI_InitFlat nie powiodło się: {message}")
 
         self._initialized = True
 
@@ -186,7 +211,7 @@ class SteamClient:
         user_stats = self._lib.SteamAPI_SteamUserStats_v013()
         if not user_stats:
             self._initialized = False
-            raise SteamworksError(
+            raise GameNotOwnedError(
                 "Nie udało się pobrać interfejsu ISteamUserStats - czy "
                 "posiadasz tę grę (AppID {}) na koncie Steam?".format(self.app_id)
             )

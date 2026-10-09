@@ -32,8 +32,11 @@ from PyQt6.QtCore import (
     QModelIndex,
     QAbstractListModel,
     QEvent,
+    QObject,
+    QRunnable,
+    QThreadPool,
 )
-from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QMouseEvent
+from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QMouseEvent, QPixmap, QImage
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -59,6 +62,8 @@ from qfluentwidgets import (
 
 from steamtools.core.library import scan_installed_games, merge_library, LibraryGame
 from steamtools.core.owned import fetch_owned_games
+from steamtools.core.covers import load_cover
+from steamtools.core.logging_setup import get_logger
 from steamtools.core.badges import (
     fetch_badge_progress,
     extract_steam_id64_from_cookie,
@@ -76,6 +81,8 @@ from steamtools.core.config import (
 )
 
 _ROW_HEIGHT = 64
+_COVER_W = 94
+_COVER_H = 44  # proporcje nagłówka Steam (460x215)
 _BTN_WIDTH = 130
 _BTN_HEIGHT = 32
 _BTN_GAP = 8
@@ -148,6 +155,58 @@ class GameListModel(QAbstractListModel):
         return None
 
 
+class _CoverTask(QRunnable):
+    def __init__(self, loader: "CoverLoader", app_id: int):
+        super().__init__()
+        self._loader = loader
+        self._app_id = app_id
+
+    def run(self) -> None:
+        image = load_cover(self._app_id)
+        if image is not None:
+            # skalowanie w wątku roboczym (2x na HiDPI), w GUI zostaje tylko QPixmap
+            image = image.scaled(
+                _COVER_W * 2, _COVER_H * 2,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self._loader.ready.emit(self._app_id, image)
+
+
+class CoverLoader(QObject):
+    """Leniwie ładuje okładki tylko dla wierszy, które delegate faktycznie
+    maluje (widoczne na ekranie), w puli wątków. Wynik - także porażka -
+    jest pamiętany do końca sesji, żeby nie ponawiać pobrań przy każdym
+    odmalowaniu."""
+
+    ready = pyqtSignal(int, object)  # app_id, QImage | None
+    covers_changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmaps: dict[int, QPixmap | None] = {}
+        self._requested: set[int] = set()
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(4)
+        self.ready.connect(self._on_ready)
+
+    def pixmap(self, app_id: int) -> QPixmap | None:
+        if app_id in self._pixmaps:
+            return self._pixmaps[app_id]
+        if app_id not in self._requested:
+            self._requested.add(app_id)
+            self._pool.start(_CoverTask(self, app_id))
+        return None
+
+    def _on_ready(self, app_id: int, image) -> None:
+        self._pixmaps[app_id] = QPixmap.fromImage(image) if isinstance(image, QImage) else None
+        self.covers_changed.emit()
+
+    def shutdown(self) -> None:
+        self._pool.clear()
+        self._pool.waitForDone(3000)
+
+
 class GameRowDelegate(QStyledItemDelegate):
     """Ręcznie maluje wiersz gry: ikonę, tytuł, AppID i dwa "przyciski"
     (Osiągnięcia / Farmuj karty). Zero żywych widgetów per wiersz - to jest
@@ -156,8 +215,9 @@ class GameRowDelegate(QStyledItemDelegate):
     achievementsClicked = pyqtSignal(int, str)
     idleClicked = pyqtSignal(int, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, covers: CoverLoader | None = None):
         super().__init__(parent)
+        self._covers = covers
         self._hovered_row: int = -1
         self._hovered_button: str | None = None
 
@@ -185,7 +245,19 @@ class GameRowDelegate(QStyledItemDelegate):
         text_color = QColor(230, 230, 230) if dark else QColor(30, 30, 30)
         subtitle_color = QColor(180, 180, 180) if dark else QColor(96, 96, 96)
 
-        left_x = rect.left() + 16
+        cover_rect = QRect(
+            rect.left() + 16, rect.top() + (rect.height() - _COVER_H) // 2, _COVER_W, _COVER_H
+        )
+        cover = self._covers.pixmap(game.app_id) if self._covers is not None else None
+        if cover is not None:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.drawPixmap(cover_rect, cover, cover.rect())
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 12) if dark else QColor(0, 0, 0, 10))
+            painter.drawRoundedRect(cover_rect, 4, 4)
+
+        left_x = cover_rect.right() + 14
         buttons_rect = self._buttons_rect(rect)
         text_right = buttons_rect.left() - 12
 
@@ -285,7 +357,9 @@ class GameListView(QListView):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.delegate = GameRowDelegate(self)
+        self.covers = CoverLoader(self)
+        self.covers.covers_changed.connect(self.viewport().update)
+        self.delegate = GameRowDelegate(self, self.covers)
         self.setItemDelegate(self.delegate)
         self.setMouseTracking(True)
         self.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
@@ -565,6 +639,7 @@ class LibraryView(QWidget):
 
     def _on_owned_error(self, message: str) -> None:
         self.refresh_btn.setEnabled(True)
+        get_logger("library").warning("pobieranie listy gier nie powiodło się: %s", message)
         if self._owned_manual:
             InfoBar.error(
                 title="Nie udało się pobrać listy gier z konta",

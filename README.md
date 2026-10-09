@@ -71,6 +71,14 @@ zależności projektu (PyQt6-Fluent-Widgets itd.) nie są zainstalowane.
 ./run.sh    # sprawdza .venv, w razie potrzeby proponuje uruchomić venv.sh, odpala aplikację
 ```
 
+## Testy i logi
+
+- Testy jednostkowe `core/`: `pip install -r requirements-dev.txt`, potem
+  `python -m pytest`. Nie wymagają Steama ani sieci i nie dotykają `~/.config`.
+- Logi: `~/.local/share/steamtools/logs/steamtools.log` (rotacja 3 x 1 MB).
+  `STEAMTOOLS_DEBUG=1 ./run.sh` włącza też poziom DEBUG. Przy zgłaszaniu
+  błędu dołącz ten plik.
+
 ## Budowanie
 
 **Najprościej: `build.sh`** - spina cały łańcuch (PyInstaller -> .deb ->
@@ -180,11 +188,12 @@ packaging/
 Pełna, aktualna lista zadań i ich status prowadzona jest w `ROADMAP.md`.
 Najważniejsze otwarte punkty:
 
-- Okładki gier w Bibliotece - obecnie ikona placeholder (`FluentIcon.GAME`),
-  docelowo cache lokalny (`appcache/librarycache/`) lub Steam Web API.
-- Brak rozróżnienia gier posiadanych-ale-niezainstalowanych - biblioteka
-  bazuje wyłącznie na lokalnie zainstalowanych grach (`appmanifest_*.acf`);
-  pełne pokrycie konta wymagałoby Steam Web API z osobnym kluczem.
+- Gry niezainstalowane (`core/owned.py`) są pobierane ze strony profilu Steam
+  Community na tej samej sesji co karty (zakładka Konto) i cache'owane na
+  dysku; bez ważnej sesji i bez cache Biblioteka pokazuje tylko gry
+  zainstalowane. To scraping HTML, więc zmiana układu strony przez Valve
+  może go zepsuć. Wymaga też, żeby "Szczegóły gier" na profilu nie były
+  ukryte.
 - Wykrywanie liczby pozostałych kart (`core/badges.py`) wymaga ręcznego
   skopiowania ciasteczka sesji z przeglądarki (Ustawienia) - to celowe,
   bezpieczne podejście (żaden hasło/login nie przechodzi przez aplikację),

@@ -26,6 +26,7 @@ from qfluentwidgets import (
 
 from steamtools.core.steamworks import is_steam_running
 from steamtools.ui.components.banner import MessageBanner
+from steamtools.core.logging_setup import get_logger
 from steamtools.ui.views.library_view import LibraryView
 from steamtools.ui.views.achievements_view import AchievementsView
 from steamtools.ui.views.idle_view import IdleView
@@ -367,6 +368,7 @@ class MainWindow(FluentWindow):
         # aż do SIGKILL/Ctrl+C.
         self._force_quit = True
         self.idle_view.shutdown()
+        self.library_view.list_view.covers.shutdown()
         self._shutdown_background_threads()
         self._tray_icon.hide()
         QApplication.instance().quit()
@@ -422,6 +424,7 @@ class MainWindow(FluentWindow):
         banner = getattr(self, "_session_banner", None)
         if banner is not None and not banner.isHidden():
             return
+        get_logger("session").warning("sesja Steam Community wygasła")
 
         if banner is None:
             banner = MessageBanner(
@@ -522,6 +525,7 @@ class MainWindow(FluentWindow):
         # wrażenie że program "wcale się nie zamknął" - dokładnie to samo,
         # co już rozwiązuje _quit_from_tray() dla ścieżki z menu traya.
         self.idle_view.shutdown()
+        self.library_view.list_view.covers.shutdown()
         self._shutdown_background_threads()
         self._tray_icon.hide()
         super().closeEvent(event)

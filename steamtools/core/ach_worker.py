@@ -16,16 +16,19 @@ import multiprocessing as mp
 import queue
 import time
 
+from steamtools.core.logging_setup import get_logger
+
 from steamtools.core.steamworks import AchievementInfo, SteamClient, SteamworksError
 
 _TIMEOUT_S = 45
+_log = get_logger("achievements")
 
 
 def _worker(app_id: int, changes: dict | None, out) -> None:
     try:
         with SteamClient(app_id=app_id) as client:
             if changes is None:
-                out.put(("ok", client.get_achievements()))
+                out.put(("ok", client.get_achievements(), ""))
                 return
             for api_name, unlocked in changes.items():
                 client.set_achievement(api_name, unlocked)
@@ -35,11 +38,11 @@ def _worker(app_id: int, changes: dict | None, out) -> None:
             for _ in range(15):
                 client.run_callbacks()
                 time.sleep(0.1)
-            out.put(("ok", stored))
+            out.put(("ok", stored, ""))
     except SteamworksError as exc:
-        out.put(("err", str(exc)))
+        out.put(("err", str(exc), exc.kind))
     except Exception as exc:  # noqa: BLE001 - błąd ma wrócić do UI, nie zabić wątku
-        out.put(("err", f"Nieoczekiwany błąd: {exc}"))
+        out.put(("err", f"Nieoczekiwany błąd: {exc}", "generic"))
 
 
 def _run(app_id: int, changes: dict | None):
@@ -48,15 +51,16 @@ def _run(app_id: int, changes: dict | None):
     process = ctx.Process(target=_worker, args=(app_id, changes, out), daemon=True)
     process.start()
     try:
-        status, value = out.get(timeout=_TIMEOUT_S)
+        status, value, kind = out.get(timeout=_TIMEOUT_S)
     except queue.Empty:
-        status, value = "err", "Steam nie odpowiedział w limicie czasu."
+        status, value, kind = "err", "Steam nie odpowiedział w limicie czasu.", "timeout"
     finally:
         process.join(timeout=5)
         if process.is_alive():
             process.terminate()
     if status == "err":
-        raise SteamworksError(value)
+        _log.warning("app %s (%s): %s [%s]", app_id, "zapis" if changes is not None else "odczyt", value, kind)
+        raise SteamworksError(value, kind)
     return value
 
 

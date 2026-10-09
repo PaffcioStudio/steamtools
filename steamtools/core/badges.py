@@ -292,12 +292,32 @@ def load_community_page(
     return html, SessionInfo(steam_id64=steam_id64, persona_name=_extract_persona_name(html))
 
 
-def _load_badges_page(session_cookie: str, session_id: str = "") -> tuple[str, SessionInfo]:
+# Strona Badges jest stronicowana (p=1, p=2, ...), po ok. 150 pozycji. Górny
+# limit stron chroni przed pętlą, gdyby Steam zaczął zwracać w kółko to samo.
+_MAX_BADGE_PAGES = 40
+_BADGE_ROW_ID_RE = re.compile(r"/(?:gamecards|badges)/(\d+)")
+
+
+def _load_badges_page(
+    session_cookie: str, session_id: str = "", page: int = 1
+) -> tuple[str, SessionInfo]:
     return load_community_page(
-        "https://steamcommunity.com/profiles/{steam_id64}/badges/?p=1",
+        f"https://steamcommunity.com/profiles/{{steam_id64}}/badges/?p={page}",
         session_cookie,
         session_id,
     )
+
+
+def _badge_row_ids(html: str) -> set[int]:
+    """AppID WSZYSTKICH wierszy badge na stronie (także gier bez dropów) -
+    służy do wykrycia końca stronicowania, nie do liczenia kart."""
+    soup = BeautifulSoup(html, "lxml")
+    ids: set[int] = set()
+    for link in soup.select(".badge_row a.badge_row_overlay"):
+        match = _BADGE_ROW_ID_RE.search(link.get("href", ""))
+        if match:
+            ids.add(int(match.group(1)))
+    return ids
 
 
 def verify_session(session_cookie: str, session_id: str = "") -> SessionInfo:
@@ -327,11 +347,27 @@ def fetch_badge_progress(session_cookie: str, session_id: str = "") -> list[Badg
     pustą listę - pusta lista oznacza wyłącznie "zalogowany, ale żadna gra
     nie ma już dropów".
 
-    Strona Badges jest stronicowana (p=1, p=2, ...) - pobieramy tylko
-    pierwszą stronę. Dociągnięcie kolejnych zostawione jako rozszerzenie.
+    Strona Badges jest stronicowana (p=1, p=2, ...) - pobieramy kolejne
+    strony, aż jedna z nich nie wniesie żadnego nowego wiersza (koniec
+    listy) albo do _MAX_BADGE_PAGES. Bez tego duże biblioteki były
+    sprawdzane tylko do pierwszych ~150 pozycji.
     """
-    html, _info = _load_badges_page(session_cookie, session_id)
-    return _parse_badges_html(html)
+    html, _info = _load_badges_page(session_cookie, session_id, 1)
+    results = _parse_badges_html(html)
+    seen = _badge_row_ids(html)
+    for page in range(2, _MAX_BADGE_PAGES + 1):
+        time.sleep(0.3)  # nie bombardujemy Steam kolejnymi zapytaniami
+        html, _info = _load_badges_page(session_cookie, session_id, page)
+        ids = _badge_row_ids(html)
+        if not ids or ids <= seen:
+            break
+        seen |= ids
+        results.extend(_parse_badges_html(html))
+
+    unique: dict[int, BadgeProgress] = {}
+    for item in results:
+        unique.setdefault(item.app_id, item)
+    return list(unique.values())
 
 
 def _parse_badges_html(html: str) -> list[BadgeProgress]:

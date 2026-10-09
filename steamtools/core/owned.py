@@ -37,6 +37,9 @@ from steamtools.core.badges import (
     load_community_page,
 )
 from steamtools.core.config import save_debug_dump
+from steamtools.core.logging_setup import get_logger
+
+_log = get_logger("owned")
 
 _GAMES_URL = "https://steamcommunity.com/profiles/{steam_id64}/games/?tab=all"
 _XML_URL = "https://steamcommunity.com/profiles/{steam_id64}/games/?tab=all&xml=1"
@@ -168,15 +171,19 @@ def fetch_owned_games(session_cookie: str, session_id: str = "") -> tuple[str, l
         )
 
     games = _fetch_via_web_api(session_cookie, session_id, steam_id64)
+    source = "web_api"
     last_html = ""
     if games is None:
+        source = "html"
         last_html, _ = load_community_page(_GAMES_URL, session_cookie, session_id, strict=False)
         games = parse_owned_games_html(last_html)
     if games is None:
+        source = "xml"
         xml, _ = load_community_page(_XML_URL, session_cookie, session_id, strict=False)
         games = parse_owned_games_xml(xml)
         last_html = last_html or xml
     if games is None:
+        _log.warning("lista gier: wszystkie źródła zawiodły")
         dump = save_debug_dump("owned_games_debug.html", last_html)
         raise SteamCommunityError(
             "Nie udało się odczytać listy gier z konta (Web API, strona "
@@ -187,4 +194,5 @@ def fetch_owned_games(session_cookie: str, session_id: str = "") -> tuple[str, l
     unique: dict[int, OwnedGame] = {}
     for game in games:
         unique.setdefault(game.app_id, game)
+    _log.info("lista gier z konta: %d (źródło: %s)", len(unique), source)
     return steam_id64, sorted(unique.values(), key=lambda g: g.name.lower())

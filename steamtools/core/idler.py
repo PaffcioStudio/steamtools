@@ -25,6 +25,10 @@ from enum import Enum, auto
 from typing import Optional
 
 from steamtools.core.steamworks import SteamClient, SteamworksError
+from steamtools.core.errors import exit_code_for, describe_exit_code
+from steamtools.core.logging_setup import get_logger
+
+_log = get_logger("idler")
 from steamtools.core.config import IdleQueueState, SavedIdleEntry, save_idle_queue, load_idle_queue
 
 # Praktyczny limit oficjalnego klienta Steam na liczbę gier zgłoszonych
@@ -64,9 +68,10 @@ def _idle_worker(app_id: int, pause_flag, stop_flag) -> None:
     try:
         client = SteamClient(app_id=app_id)
         client.init()
-    except SteamworksError:
-        # Sygnalizujemy błąd przez kod wyjścia; proces nadrzędny to wyłapie.
-        raise SystemExit(1)
+    except SteamworksError as exc:
+        # Sygnalizujemy błąd przez kod wyjścia (rodzaj błędu zakodowany w
+        # liczbie, patrz core/errors.py); proces nadrzędny to wyłapie.
+        raise SystemExit(exit_code_for(exc))
 
     try:
         while not stop_flag.is_set():
@@ -201,7 +206,8 @@ class IdleManager:
                 exitcode = job.process.exitcode
                 if exitcode not in (0, None):
                     job.state = IdleState.ERROR
-                    job.error_message = f"Proces zakończył się kodem {exitcode}"
+                    job.error_message = describe_exit_code(exitcode)
+                    _log.warning("idle app %s: kod wyjścia %s", app_id, exitcode)
                 else:
                     job.state = IdleState.STOPPED
 
